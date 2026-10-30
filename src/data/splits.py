@@ -1,8 +1,6 @@
-"""Group-aware splits and pair utilities.
-
-The hard-negative TriviaQA file holds exactly two rows per question (one correct answer = label 0,
-one wrong answer = label 1). A row-level split puts the two siblings on different sides, so the
-split has to be made per question ("group").
+"""Provides group-aware data splits, centering, and paired-answer metrics.
+Feature extraction, probe training, and the main trainer use these shared utilities.
+The functions here keep question pairs together and support paired evaluation.
 """
 import numpy as np
 from sklearn.model_selection import (GroupShuffleSplit, StratifiedGroupKFold, StratifiedKFold,

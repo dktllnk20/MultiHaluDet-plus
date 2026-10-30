@@ -1,23 +1,6 @@
-"""RQ1 baseline "probe-only": AUROC cua rieng logit probe (PCA-256 + LR), khong deep net, khong stacker.
-
-Doc results/probe/<ds>_<lang>_<model>_<pm>_<views>_s<seed>_pca256_C0.02.npz (do run_pipeline --stage probe tao)
-va dung DUNG split cua pipeline (outer_split theo cau hoi, bo hang extraction loi). Khong train gi them.
-
-Chay (tu thu muc goc):
-    python src/rq/rq1_probe_only.py                                   # mistral-7b + llama2-7b, en, triviaqa, 5 seed, verify + plain
-    python src/rq/rq1_probe_only.py --models mistral-7b --prompt_modes verify
-
-Cac cach lay diem (layer luon chon bang OOF AUROC tren TRAIN, khong nhin test):
-  best_layer_<view>   : layer co OOF AUROC cao nhat cua view do
-  best_cell           : (layer, view) co OOF AUROC cao nhat
-  mean_best_views     : trung binh (da chuan hoa) logit tai layer tot nhat cua tung view
-  mean_top5           : trung binh 5 (layer, view) co OOF tot nhat
-  mean_all            : trung binh tat ca (layer, view)
-  lr_all              : LR (C=0.05) tren toan bo logit probe, fit tren hang train
-Luu y: logit probe cua hang train la OOF (1 probe), cua hang test la trung binh 5 probe -> phan phoi hoi khac;
-cac cot duoc chuan hoa bang thong ke cua train truoc khi trung binh / dua vao LR.
-
-Ket qua: results/rq1_probe_only/{per_seed,summary,layer_auc}.csv (+ in bang so voi deep/ens trong all_runs.csv neu co).
+"""Evaluates probe-only baselines using cached RQ1 hidden-state probe scores.
+It reuses the feature splits from run_pipeline.py and writes per-seed and summary CSV files.
+Run this module directly after v2 probes have been generated.
 """
 import argparse
 import os
@@ -49,7 +32,7 @@ def _auc(y, s):
 def one_run(ds, lang, model, pm, views, seed):
     pp = probe_path(ds, lang, model, pm, views, seed)
     if not pp.exists():
-        print(f"[bo qua] thieu {pp.name}")
+        print(f"[skipped] missing {pp.name}")
         return None
     cfg = get_config()
     d = load_v2(str(FEAT2_DIR / fkey2(ds, lang, model, pm)))
@@ -60,17 +43,18 @@ def one_run(ds, lang, model, pm, views, seed):
     P = z["probe"]                                   # [Nk, L, V]
     pviews = [str(v) for v in z["views"]]
     if P.shape[0] != len(y) or pviews != views:
-        print(f"[bo qua] {pp.name}: shape {P.shape} / views {pviews} khong khop feature ({len(y)} hang, {views})")
+        print(f"[skipped] {pp.name}: shape {P.shape} / views {pviews} do not match "
+              f"the feature data ({len(y)} rows, {views})")
         return None
     _, L, V = P.shape
     ytr, yte, gte = y[tr], y[te], g[te]
 
-    # chuan hoa theo thong ke train tung cot (layer, view)
+    # Normalize each layer/view column using training-set statistics.
     mu, sd = P[tr].mean(0), P[tr].std(0) + 1e-6
     Z = (P - mu) / sd
 
     oof = np.array([[_auc(ytr, P[tr, l, v]) for v in range(V)] for l in range(L)])
-    tst = np.array([[_auc(yte, P[te, l, v]) for v in range(V)] for l in range(L)])   # chi de bao cao, khong de chon
+    tst = np.array([[_auc(yte, P[te, l, v]) for v in range(V)] for l in range(L)])   # Report only; never use for selection.
     layer_rows = [dict(dataset=ds, lang=lang, model=model, prompt=pm, seed=seed, view=views[v], layer=l + 1,
                        oof_auc=oof[l, v], test_auc=tst[l, v]) for l in range(L) for v in range(V)]
 
@@ -119,7 +103,7 @@ def main():
                             rows += r[0]
                             layer_rows += r[1]
     if not rows:
-        sys.exit("Khong co file probe nao doc duoc.")
+        sys.exit("No probe files could be read.")
     OUT.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
     df.to_csv(OUT / "per_seed.csv", index=False)
@@ -130,7 +114,7 @@ def main():
     summ.to_csv(OUT / "summary.csv", index=False)
 
     pd.set_option("display.width", 200, "display.max_columns", 20, "display.float_format", "{:.4f}".format)
-    print("\n=== Probe-only (test AUROC, mean/std qua seed) ===")
+    print("\n=== Probe-only (test AUROC, mean/std across seeds) ===")
     print(summ.to_string(index=False))
 
     runs = RES_ROOT / "all_runs.csv"
@@ -138,9 +122,9 @@ def main():
         r = pd.read_csv(runs)
         r = r[r["cond"].isin(["base", "full", "add_B", "loo_B"]) & r["dataset"].isin(a.datasets)]
         t = r.groupby(["dataset", "lang", "model", "cond"])[["deep_test_auc", "ens_auc"]].mean().reset_index()
-        print("\n=== Deep / ensemble AUROC cua RQ1 (de so voi probe-only o tren) ===")
+        print("\n=== RQ1 deep/ensemble AUROC (for comparison with probe-only results) ===")
         print(t.to_string(index=False))
-    print(f"\nLuu o {OUT}")
+    print(f"\nSaved to {OUT}")
 
 
 if __name__ == "__main__":

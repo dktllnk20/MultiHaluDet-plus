@@ -1,32 +1,6 @@
-"""RQ1: mỗi nhóm thành phần của kiến trúc mới đóng góp bao nhiêu AUROC?
-
-Một file duy nhất, chạy qua run_pipeline.py (cờ --rq / --rq_step):
-    python run_pipeline.py --rq 1 --all --dry_run               # xem kế hoạch, không chạy gì
-    python run_pipeline.py --rq 1 --all --keep_going            # lưới đầy đủ (mức nhóm)
-    python run_pipeline.py --rq 1 --model llama2-7b --lang vi --dataset triviaqa --seed 1
-    python run_pipeline.py --rq 1 --rq_step collect --all       # gom log/OOF thành CSV + bảng đóng góp
-    python run_pipeline.py --rq 1 --all --level fine            # thêm từng thành phần riêng lẻ
-    python run_pipeline.py --rq 1 --model llama2-7b --lang en --dataset triviaqa --conditions full loo_A add_A
-
-Ba nhóm thành phần (tất cả chạy trong pipeline --feat v2, nên MỌI điều kiện dùng chung group split):
-    A  answer-conditional : A_prompt (verify prompt) | A_ll (13 cột answer-LL/PMI) | A_yn (3 cột Yes/No)
-    B  hidden-state probes: B_seq (logit probe làm kênh seq) | B_glob (4 tóm tắt probe nối vào global)
-    C  training/stacking  : C_delta (layer-delta) | C_scale (layer-scale) | C_rank (rank loss 0.1) | C_logit (stack logit)
-
-Điều kiện mức nhóm:  base (tắt hết) | full (bật hết) | loo_<G> = full bỏ nhóm G | add_<G> = base chỉ bật nhóm G
-Đóng góp của nhóm G:  LOO:G = full - loo_G  và  ADD:G = add_G - base  (ghép cặp theo seed).
-Mức fine thêm loo_<thành phần> / add_<thành phần>.
-
-Lưu ý thiết kế:
-  * Group split LUÔN bật ở --feat v2 nên "group folds" không ablate được trong pipeline này (cố định, không thuộc nhóm C).
-  * A_yn cần verify prompt: loo_A_prompt bỏ luôn A_yn; add_A_yn không tồn tại, thay bằng add_A_prompt_yn so với add_A_prompt.
-  * Probe logit được cache theo (dataset, lang, model, prompt_mode, views, seed) bởi run_pipeline.py --stage probe,
-    nên bật/tắt B_seq/B_glob (--probe_use) không tính lại probe.
-  * Điều kiện có cùng cấu hình train (chỉ khác C_logit) dùng chung một lần train_oof (OOF được hard-link sang tag của từng điều kiện).
-  * collect chỉ ghép cặp những seed mà hai điều kiện có cùng n_test (cùng tập test).
-
-Log:     logs/rq1_ablation/<model>/<lang>/rq1_<dataset>_<cond>_s<seed>.log  (ensemble), kèm log extract/probe/train. Log tổng: logs/rq1_ablation/master.log
-Kết quả: results/rq1_ablation/all_{runs,summary,paired_per_seed,paired_summary}.csv và results/rq1_ablation/<model>/<lang>/*.csv
+"""Runs the RQ1 component-ablation experiments and summarizes paired results.
+This research workflow uses run_pipeline.py stages and stores logs and CSV reports.
+Invoke this module directly to execute or collect the RQ1 experiment grid.
 """
 import argparse
 import json
@@ -53,21 +27,21 @@ RES_ROOT = ROOT / "results" / "rq1_ablation"
 
 MODELS = ["mistral-7b", "llama2-7b"]
 LANGS = ["en", "fr", "vi", "bn"]
-DATASETS = ["triviaqa", "halueval"]       # TriviaQA là kết quả chính nên chạy trước
+DATASETS = ["triviaqa", "halueval"]       # Run TriviaQA first as the primary result.
 SEEDS = [1, 11, 29, 37, 43]
 STAGES = ["extract", "probe", "train_oof", "ensemble"]
 
-# ------------------------------------------------------------------ điều kiện
+# ------------------------------------------------------------------ conditions
 COMPONENTS = ["A_prompt", "A_ll", "A_yn", "B_seq", "B_glob", "C_delta", "C_scale", "C_rank", "C_logit"]
 GROUPS = {"A": COMPONENTS[0:3], "B": COMPONENTS[3:5], "C": COMPONENTS[5:9]}
-N_BASE, N_LL, N_YN = 30, 13, 3     # số cột global: base_*, ans_*, v_*
+N_BASE, N_LL, N_YN = 30, 13, 3     # Global feature counts: base_*, ans_*, v_*.
 RANK_WEIGHT = 0.1
 
 
 def _norm(comps):
     comps = set(comps)
     if "A_prompt" not in comps:
-        comps.discard("A_yn")      # Yes/No chỉ tồn tại với verify prompt
+        comps.discard("A_yn")      # Yes/No features require the verification prompt.
     return frozenset(comps)
 
 
@@ -91,14 +65,14 @@ ALL_CONDS = {**GROUP_CONDS, **FINE_CONDS}
 
 
 def build_pairs():
-    """pair -> (điều kiện 'có', điều kiện 'không'); delta = có - không."""
+    """Map each comparison to (with, without); delta is with minus without."""
     group = {"ALL": ("full", "base")}
     for g in GROUPS:
         group[f"LOO:{g}"] = ("full", f"loo_{g}")
         group[f"ADD:{g}"] = (f"add_{g}", "base")
     fine = {}
     for k in COMPONENTS:
-        fine[f"LOO:{k}"] = ("full", f"loo_{k}")      # LOO:A_prompt gồm cả A_yn (bị bỏ theo)
+        fine[f"LOO:{k}"] = ("full", f"loo_{k}")      # LOO:A_prompt also removes A_yn.
         if k != "A_yn":
             fine[f"ADD:{k}"] = (f"add_{k}", "base")
     fine["ADD:A_yn|A_prompt"] = ("add_A_prompt_yn", "add_A_prompt")
@@ -110,7 +84,7 @@ ALL_PAIRS = {**GROUP_PAIRS, **FINE_PAIRS}
 
 
 def cond_spec(comps, a):
-    """Cờ run_pipeline.py cho một điều kiện + chữ ký cấu hình train (không tính stack_mode)."""
+    """Build run_pipeline.py flags and the training signature for one condition."""
     views = [v.strip() for v in a.views.split(",") if v.strip()]
     pm = "verify" if "A_prompt" in comps else "plain"
     glob = ["base"] + [g for g, k in (("ll", "A_ll"), ("yn", "A_yn")) if k in comps]
@@ -132,7 +106,7 @@ def cond_spec(comps, a):
             "sig": f"{pm}-{'_'.join(glob)}-{probe}-{c_flags}", "glob_dim": glob_dim, "views": views}
 
 
-# ------------------------------------------------------------------ đường dẫn
+# ------------------------------------------------------------------ paths
 def log_dir(model, lang):
     return LOG_ROOT / model / lang
 
@@ -157,7 +131,7 @@ def feat_state(ds, lang, model, pm, views):
 
 
 def probe_path(ds, lang, model, pm, views, seed):
-    from src.config import get_config      # import muộn: kéo theo torch
+    from src.config import get_config      # Import lazily because it loads torch.
     cfg = get_config()
     return PROBE_DIR / f"{fkey2(ds, lang, model, pm)}_{'-'.join(views)}_s{seed}_pca{cfg.probe_pca_dim}_C{cfg.probe_C}.npz"
 
@@ -167,7 +141,7 @@ OOF_FILES = ["X_train_deep", "X_test_deep", "oof_logits", "test_logits", "X_glob
 
 
 def alias_oof(src_key, dst_key):
-    """OOF của train_oof nằm dưới tag train; ensemble đọc dưới tag điều kiện -> hard-link (không tốn đĩa)."""
+    """Alias train-stage OOF files for ensemble conditions without duplicating data."""
     for name in OOF_FILES:
         s, d = OOF_DIR / f"{name}_{src_key}.npy", OOF_DIR / f"{name}_{dst_key}.npy"
         if d.exists() or d.is_symlink():
@@ -179,7 +153,7 @@ def alias_oof(src_key, dst_key):
                 shutil.copy2(s, d)
 
 
-# ------------------------------------------------------------------ tiện ích chung
+# ------------------------------------------------------------------ shared utilities
 class Tee:
     def __init__(self, *files):
         self.files = files
@@ -194,7 +168,7 @@ class Tee:
 
 
 def run_logged(cmd, log_path, mode):
-    """Chạy cmd tại ROOT, vừa in ra màn hình vừa ghi log. Trả về return code."""
+    """Run a command from ROOT, mirror output to the console and log, and return its status."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     with open(log_path, mode, encoding="utf-8") as log:
@@ -209,7 +183,7 @@ def run_logged(cmd, log_path, mode):
 
 
 def merge_write(path, new, models, langs, datasets):
-    """Ghi all_*.csv kiểu GỘP: bỏ các dòng cũ thuộc (model, lang, dataset) vừa xử lý, giữ phần còn lại."""
+    """Merge all_*.csv while replacing rows for the model/language/dataset just processed."""
     merged = new
     if path.exists():
         old = pd.read_csv(path)
@@ -226,40 +200,40 @@ _DATA_CACHE = {}
 
 
 def check_data(ds, lang):
-    """(ok, thông báo) cho data/<ds>_<lang>.json; in thống kê nhãn một lần cho mỗi (ds, lang)."""
+    """Check a dataset file and report label statistics once per dataset/language pair."""
     if (ds, lang) in _DATA_CACHE:
         return _DATA_CACHE[(ds, lang)]
     path = ROOT / "data" / f"{ds}_{lang}.json"
     rel = path.relative_to(ROOT)
     if not path.exists():
         if ds == "halueval" and lang == "en":
-            res = (True, "không có file local, loader sẽ lấy từ HuggingFace (pminervini/HaluEval)")
+            res = (True, "No local file; the loader will fetch pminervini/HaluEval from Hugging Face.")
         elif ds == "triviaqa" and lang == "en":
-            res = (False, f"thiếu {rel} (loader sẽ rơi về negative = đáp án câu hỏi ngẫu nhiên)")
+            res = (False, f"Missing {rel}; the loader fallback creates negatives from random answers.")
         else:
-            res = (False, f"thiếu {rel}")
+            res = (False, f"Missing {rel}")
     else:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             missing = [k for k in ("question", "answer", "is_hallucination") if k not in data[0]]
             if missing:
-                res = (False, f"{rel} thiếu key {missing}")
+                res = (False, f"{rel} is missing keys {missing}")
             else:
                 labels = np.array([int(d["is_hallucination"]) for d in data])
-                msg = f"{rel}: {len(data)} mẫu, {labels.sum()} hallucination ({labels.mean():.1%})"
+                msg = f"{rel}: {len(data)} samples, {labels.sum()} hallucinations ({labels.mean():.1%})"
                 if abs(labels.mean() - 0.5) > 0.1:
-                    msg += "  [cảnh báo: nhãn không cân bằng]"
+                    msg += "  [warning: imbalanced labels]"
                 if ds == "triviaqa" and len(data) > 10000:
-                    msg += "  [cảnh báo: loader chỉ lấy 10000 dòng ngẫu nhiên -> có thể làm lẻ cặp]"
+                    msg += "  [warning: loader samples 10,000 rows and may split question pairs]"
                 res = (True, msg)
         except Exception as e:
-            res = (False, f"{rel} không đọc được: {type(e).__name__}: {e}")
+            res = (False, f"Could not read {rel}: {type(e).__name__}: {e}")
     print(f"[data] {ds}/{lang}: {res[1]}")
     _DATA_CACHE[(ds, lang)] = res
     return res
 
 
-# ------------------------------------------------------------------ bước run
+# ------------------------------------------------------------------ run stage
 def build_jobs(a, conds, specs):
     views = [v.strip() for v in a.views.split(",") if v.strip()]
     jobs, skipped = [], []
@@ -273,7 +247,7 @@ def build_jobs(a, conds, specs):
                 for pm in sorted({specs[c]["pm"] for c in conds}):
                     st = feat_state(ds, lang, model, pm, views)
                     if st == "old" and not a.force_extract:
-                        skipped.append((model, lang, ds, pm, "feature v2 cũ (views khác): xóa hoặc dùng --force_extract"))
+                        skipped.append((model, lang, ds, pm, "stale v2 features (different views); remove them or use --force_extract"))
                     elif st != "ok" and not data_ok:
                         skipped.append((model, lang, ds, pm, msg))
                     else:
@@ -353,14 +327,14 @@ def step_run(a):
         sys.stdout = Tee(sys.__stdout__, open(LOG_ROOT / "master.log", "a", encoding="utf-8"))
         print(f"\n######## {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(sys.argv)}")
 
-    print("\n--- Điều kiện ---")
+    print("\n--- Conditions ---")
     for c, sp in specs.items():
         print(f"  {c:16s} prompt={sp['pm']:6s} glob={'+'.join(sp['glob']):10s} probe={sp['probe']:5s} "
-              f"stack={sp['stack']:6s} train={sp['sig']}  (global {sp['glob_dim']} cột)")
-    print("\n--- Kiểm tra dữ liệu ---")
+              f"stack={sp['stack']:6s} train={sp['sig']}  ({sp['glob_dim']} global features)")
+    print("\n--- Checking data ---")
     jobs, skipped = build_jobs(a, conds, specs)
 
-    print("\n--- Kế hoạch (cần chạy / tổng) ---")
+    print("\n--- Plan (pending / total) ---")
     combos = sorted({(j["model"], j["lang"], j["ds"]) for j in jobs})
     for model, lang, ds in combos:
         cells = []
@@ -368,10 +342,10 @@ def step_run(a):
             sel = [j for j in jobs if (j["model"], j["lang"], j["ds"]) == (model, lang, ds) and j["kind"] == kind]
             cells.append(f"{kind}: {sum(j['pending'] for j in sel)}/{len(sel)}")
         print(f"  {model:11s} {lang} {ds:9s} " + "  ".join(cells))
-    print(f"Tổng: {len(combos)} tổ hợp | " + " | ".join(
+    print(f"Total: {len(combos)} combinations | " + " | ".join(
         f"{k} {sum(j['pending'] for j in jobs if j['kind'] == k)}" for k in ("extract", "probe", "train", "ensemble")))
     for model, lang, ds, pm, why in skipped:
-        print(f"  [bỏ qua] {model} {lang} {ds} ({pm}): {why}")
+        print(f"  [skipped] {model} {lang} {ds} ({pm}): {why}")
     if a.dry_run:
         return
 
@@ -383,7 +357,7 @@ def step_run(a):
         if j.get("seed") is not None:
             label += f" s{j['seed']}"
         if any(d in failed for d in j["deps"]):
-            print(f"\n[bỏ qua] {label}: bước phụ thuộc đã lỗi")
+            print(f"\n[skipped] {label}: a prerequisite stage failed")
             failed.add(j["id"])
             continue
         print(f"\n=== {label} ===")
@@ -393,7 +367,7 @@ def step_run(a):
         rc = run_logged(j["cmd"], j["log"], j["mode"])
         print(f"[{j['kind']}] {time.perf_counter() - t0:.0f}s")
         if rc != 0 or not finished_ok(j):
-            msg = f"[fail] {label} rc={rc}, xem {j['log']}"
+            msg = f"[fail] {label} rc={rc}; see {j['log']}"
             failures.append(msg)
             failed.add(j["id"])
             if a.keep_going:
@@ -404,11 +378,11 @@ def step_run(a):
     for msg in failures:
         print(msg)
     for model, lang, ds, pm, why in skipped:
-        print(f"[đã bỏ qua] {model} {lang} {ds} ({pm}): {why}")
-    print("Gom kết quả:  python run_pipeline.py --rq 1 --rq_step collect --all")
+        print(f"[skipped] {model} {lang} {ds} ({pm}): {why}")
+    print("Collect results with the rq1.py --step collect command.")
 
 
-# ------------------------------------------------------------------ bước collect
+# ------------------------------------------------------------------ collect stage
 RESULT = re.compile(r"^AUC: ([\d.]+), F1: ([\d.]+), Acc: ([\d.]+)", re.M)
 PAIRACC = re.compile(r"^Pair accuracy \(.*?\): ([\d.]+)", re.M)
 GROUP_KEYS = ["model", "lang", "dataset"]
@@ -447,9 +421,9 @@ def collect_one(model, lang, ds, cond, seed, spec):
         if gp.exists():
             row["deep_pair_acc"] = float(pair_accuracy(z_te, y_te, np.load(gp))[0])
         if row["glob_dim"] != spec["glob_dim"]:
-            problems.append(f"glob_dim={row['glob_dim']} (cần {spec['glob_dim']})")
+            problems.append(f"glob_dim={row['glob_dim']} (expected {spec['glob_dim']})")
     except FileNotFoundError:
-        problems.append("thiếu file OOF")
+        problems.append("missing OOF files")
     row["config_problem"] = "; ".join(problems)
     row["complete"] = "ens_auc" in row and "deep_test_auc" in row
     return row
@@ -507,18 +481,18 @@ def step_collect(a):
                         if r:
                             rows.append(r)
     if not rows:
-        sys.exit("Không thấy log rq1_<dataset>_<cond>_s<seed>.log nào.")
+        sys.exit("No rq1_<dataset>_<condition>_s<seed>.log files were found.")
     runs = pd.DataFrame(rows)
     for _, r in runs[runs["config_problem"] != ""].iterrows():
-        print(f"[cảnh báo] {r['model']}/{r['lang']}/{r['log']}: {r['config_problem']}")
+        print(f"[warning] {r['model']}/{r['lang']}/{r['log']}: {r['config_problem']}")
     for _, r in runs[~runs["complete"]].iterrows():
-        print(f"[chưa xong] {r['model']}/{r['lang']}/{r['log']}")
+        print(f"[incomplete] {r['model']}/{r['lang']}/{r['log']}")
 
     RES_ROOT.mkdir(parents=True, exist_ok=True)
     runs_all = merge_write(RES_ROOT / "all_runs.csv", runs, a.models, a.langs, a.datasets)
     ok = runs[runs["complete"] & (runs["config_problem"] == "")]
     if ok.empty:
-        sys.exit("Không có run hợp lệ để tổng hợp.")
+        sys.exit("No valid runs are available to summarize.")
     summary, per_seed, paired = analyze(ok, pairs)
     summary = merge_write(RES_ROOT / "all_summary.csv", summary, a.models, a.langs, a.datasets)
     per_seed = merge_write(RES_ROOT / "all_paired_per_seed.csv", per_seed, a.models, a.langs, a.datasets)
@@ -534,9 +508,9 @@ def step_collect(a):
 
     pd.set_option("display.width", 220, "display.max_columns", 30, "display.max_rows", 300,
                   "display.float_format", "{:.4f}".format)
-    print(f"\n{len(ok)}/{len(runs)} run hợp lệ. CSV: {RES_ROOT}/all_*.csv")
+    print(f"\n{len(ok)}/{len(runs)} valid runs. CSV files: {RES_ROOT}/all_*.csv")
     if paired.empty:
-        print("Chưa có cặp điều kiện đầy đủ để so sánh.")
+        print("No complete condition pairs are available for comparison.")
         return
     order = list(pairs)
     for ds in DATASETS:
@@ -554,9 +528,10 @@ def step_collect(a):
             combos=("delta_mean", "size"), seeds_better=("n_with_better", "sum"), seeds=("n_seeds", "sum"))
         t = t.join(e).reindex([x for x in order if x in t.index])
         t["better"] = t["seeds_better"].astype(int).astype(str) + "/" + t["seeds"].astype(int).astype(str)
-        print(f"\n=== {ds}: delta = có - không, trung bình trên {int(t['combos'].max())} tổ hợp model x lang ===")
+        print(f"\n=== {ds}: delta = with - without, averaged over {int(t['combos'].max())} model/language combinations ===")
         print(t[["d_ens", "d_ens_min", "d_ens_max", "d_deep", "d_pairacc", "better"]].to_string())
-    print("\nLưu ý: với n=5 seed, Wilcoxon có p nhỏ nhất 0.0625; hãy nhìn hướng, số seed 'có' > 'không' và độ lớn hiệu ứng.")
+    print("\nNote: with five seeds, the minimum Wilcoxon p-value is 0.0625; consider the direction, "
+          "number of positive seeds, and effect size.")
 
 
 # ------------------------------------------------------------------ main
@@ -569,21 +544,21 @@ def main():
     p.add_argument("--datasets", nargs="+", default=DATASETS, choices=DATASETS)
     p.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
     p.add_argument("--level", default="group", choices=["group", "fine"],
-                   help="group: base/full/loo_A,B,C/add_A,B,C; fine: thêm từng thành phần riêng lẻ")
+                   help="group: base/full/loo_A,B,C/add_A,B,C; fine: include individual components")
     p.add_argument("--conditions", nargs="+", default=None, choices=list(ALL_CONDS),
-                   help="Chỉ chạy/gom các điều kiện này (mặc định theo --level)")
+                   help="Run or collect only these conditions (default depends on --level)")
     p.add_argument("--stages", nargs="+", default=STAGES, choices=STAGES)
-    p.add_argument("--views", default="last,amean", help="Phải khớp --views của extraction v2")
+    p.add_argument("--views", default="last,amean", help="Must match the views used by v2 extraction.")
     p.add_argument("--quant", default="4bit", choices=["4bit", "8bit", "fp16"])
     p.add_argument("--stacker", default="full", choices=["full", "lite"])
     p.add_argument("--extract_batch_size", type=int, default=4)
-    p.add_argument("--force", action="store_true", help="Chạy lại train/ensemble kể cả khi đã có kết quả")
-    p.add_argument("--force_extract", action="store_true", help="Trích xuất lại feature (và probe)")
-    p.add_argument("--keep_going", action="store_true", help="Bước lỗi thì ghi nhận rồi chạy tiếp")
-    p.add_argument("--dry_run", action="store_true", help="Chỉ in kế hoạch")
+    p.add_argument("--force", action="store_true", help="Rerun training and ensemble even when outputs exist.")
+    p.add_argument("--force_extract", action="store_true", help="Re-extract features and probes.")
+    p.add_argument("--keep_going", action="store_true", help="Record failed stages and continue.")
+    p.add_argument("--dry_run", action="store_true", help="Print the execution plan without running it.")
     a = p.parse_args()
     if a.step == "diagnostics":
-        sys.exit("RQ1 mới không có bước diagnostics; dùng --rq_step run hoặc collect.")
+        sys.exit("RQ1 has no diagnostics step; choose run or collect.")
     (step_run if a.step == "run" else step_collect)(a)
 
 

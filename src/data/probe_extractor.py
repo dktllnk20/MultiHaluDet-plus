@@ -1,15 +1,6 @@
-"""Feature extraction v2: keeps the hidden-state VECTORS (for linear probes) next to the old scalar
-statistics, adds a verification prompt and richer answer log-likelihood features.
-
-One forward pass per batch (plus one short pass on "Answer: <a>" for the PMI baseline) gives:
-  H_<view>.npy  float16 [L, N, D]   hidden state per sampled layer, one file per view
-      last   final token of the prompt (verify mode: the ':' after "(Yes or No)"; plain mode: last answer token)
-      alast  last answer token
-      afirst first answer token
-      amean  mean over the answer tokens
-  seq.npy       float32 [N, L, 12]  same 12 statistics per layer as v1 (the mean-pool pair is over the answer span)
-  glob.npy      float32 [N, G]      30 v1 global features + 13 answer-LL/PMI features (+ 3 Yes/No features in verify mode)
-  y.npy, groups.npy, valid.npy, meta.json
+"""Extracts v2 scalar and hidden-state features for question-answer samples.
+The pipeline calls this module during the extraction stage before probing and training.
+Feature arrays and checkpoint metadata are written to the selected feature directory.
 """
 import json
 import os
@@ -22,6 +13,7 @@ from tqdm import tqdm
 
 from src.data.feature_extractor import _layer_stats, get_anchor_stats, get_sampled_layer_indices
 from src.data.splits import make_groups
+from src.settings.runtime import ensure_directory
 
 VIEWS = ("last", "alast", "afirst", "amean")
 MAX_LEN = 384
@@ -209,7 +201,7 @@ def extract_dataset_v2(samples, tokenizer, model_llm, config, out_dir, mode="ver
     bad = [v for v in views if v not in VIEWS]
     if bad:
         raise ValueError(f"unknown views {bad}; choose from {VIEWS}")
-    os.makedirs(out_dir, exist_ok=True)
+    ensure_directory(out_dir)
     N = len(samples)
     meta_path, prog_path = os.path.join(out_dir, "meta.json"), os.path.join(out_dir, "progress.json")
     p = lambda name: os.path.join(out_dir, name)       # noqa: E731

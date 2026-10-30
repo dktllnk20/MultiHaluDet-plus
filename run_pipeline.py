@@ -1,19 +1,20 @@
+"""Runs feature extraction, optional v2 probes, model training, and ensembling.
+Uses configuration and stages from src/; run from any directory with Python.
+Creates feature outputs, result plots, and per-model logs under the project root.
+"""
 import os
 
-# Must be set before torch initialises CUDA; reduces memory fragmentation on small GPUs.
+# Set before torch initializes CUDA to reduce memory fragmentation.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import multiprocessing
-import subprocess
-import sys
-import time
 from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
-import torch
-import numpy as np
-import random
 import gc
+import random
+
+import numpy as np
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import RobustScaler, StandardScaler
@@ -21,38 +22,30 @@ from sklearn.preprocessing import RobustScaler, StandardScaler
 from src.config import get_config, MODEL_REGISTRY, PIPELINE_MODELS
 from src.data.loader import load_halueval, load_triviaqa
 from src.data.feature_extractor import extract_dataset, SEQ_DIM, GLOB_BASE_DIM
-from src.data.probe_extractor import extract_dataset_v2, load_v2, VIEWS
+from src.data.probe_extractor import extract_dataset_v2, load_v2
 from src.data.splits import (center_by_group, inner_splitter, make_groups, outer_split,
                              pair_accuracy, rows_to_keep)
 from src.probe.layer_probe import run_layer_probes
 from src.training.trainer import train_deep_model_fold, extract_features_batch, extract_logits_batch
-from src.ensemble.meta_learner import get_ensemble, calibrate_ensemble, temperature_scale
+from src.ensemble.meta_learner import get_ensemble, calibrate_ensemble
 from src.utils.metrics import find_best_thresholds, evaluate_all, compute_uncertainty_metrics
 from src.utils.visualization import plot_publication_results
-
-RQ_STEPS = ["run", "collect", "diagnostics"]
-# Lưới đầy đủ khi chạy --rq N --all (khớp với mặc định của src/rq/rq1_common.py).
-RQ_GRID = {
-    "models": ["mistral-7b", "llama2-7b"],
-    "langs": ["en", "fr", "vi", "bn"],
-    "datasets": ["halueval", "triviaqa"],
-    "seeds": [1, 11, 29, 37, 43],
-}
+from src.settings.runtime import ROOT_DIR, capture_run_log, ensure_directory
 
 
-GLOB_GROUPS = {"base": "base_", "ll": "ans_", "yn": "v_"}   # nhóm cột global v2 -> tiền tố trong glob_names
+GLOB_GROUPS = {"base": "base_", "ll": "ans_", "yn": "v_"}
 
 
 def _select_glob(X_glob, names, use):
-    """Giữ các nhóm cột global v2 trong `use` (base: 30 cột v1; ll: 13 cột answer-LL/PMI; yn: 3 cột Yes/No)."""
+    """Keep the selected v2 global-feature groups."""
     groups = [g.strip() for g in use.split(",") if g.strip()]
     bad = [g for g in groups if g not in GLOB_GROUPS]
     if bad:
-        raise SystemExit(f"--glob_use: nhóm không hợp lệ {bad}; chọn từ {list(GLOB_GROUPS)}")
+        raise SystemExit(f"Invalid --glob_use groups {bad}; choose from {list(GLOB_GROUPS)}")
     prefixes = tuple(GLOB_GROUPS[g] for g in groups)
     cols = [i for i, n in enumerate(names) if n.startswith(prefixes)]
     if not cols:
-        raise SystemExit(f"--glob_use {use} không chọn được cột nào")
+        raise SystemExit(f"--glob_use {use} selected no columns")
     return X_glob[:, cols]
 
 
@@ -62,16 +55,20 @@ def _opt(args, name, default):
 
 
 def _key(args, tag=True):
-    """File-name suffix. --tag only applies to run-specific outputs (OOF, plots), never to the
-    extracted LLM features, so one extraction can serve many seeds / ablations."""
+    """Build the feature or run output key, including the selected feature version and record limit."""
     base = f"{args.dataset}_{args.lang}_{args.model}"
-    if tag and _opt(args, "feat", "v1") == "v2":
-        base += f"_v2{args.prompt_mode}"
-    return f"{base}_{args.tag}" if tag and args.tag else base
+    if _opt(args, "limit", None) is not None:
+        base += f"_limit{args.limit}"
+    feat = "v2" if _opt(args, "v2", False) else _opt(args, "feat", "v1")
+    if tag and feat == "v2":
+        base += f"_v2{_opt(args, 'prompt_mode', 'verify')}"
+    tag_value = _opt(args, "tag", "")
+    return f"{base}_{tag_value}" if tag and tag_value else base
 
 
 def _fkey2(args):
-    return f"{args.dataset}_{args.lang}_{args.model}_{args.prompt_mode}"
+    limit = f"_limit{args.limit}" if _opt(args, "limit", None) is not None else ""
+    return f"{args.dataset}_{args.lang}_{args.model}{limit}_{_opt(args, 'prompt_mode', 'verify')}"
 
 
 def _feat_dir2(args):
@@ -79,15 +76,19 @@ def _feat_dir2(args):
 
 
 def _probe_path(args, config):
-    views = "-".join(v.strip() for v in args.views.split(","))
-    tag = f"{views}_s{config.seed}_pca{config.probe_pca_dim}_C{config.probe_C}" + ("_pc" if args.pair_center else "")
+    views = "-".join(v.strip() for v in _opt(args, "views", "last,amean").split(","))
+    tag = (f"{views}_s{config.seed}_pca{config.probe_pca_dim}_C{config.probe_C}"
+           + ("_pc" if _opt(args, "pair_center", False) else ""))
     return f"results/probe/{_fkey2(args)}_{tag}.npz"
 
 
 def _load_samples(args, config):
     if args.dataset == "halueval":
-        return load_halueval(lang=args.lang)
-    return load_triviaqa(lang=args.lang, seed=config.seed)
+        samples = load_halueval(lang=args.lang)
+    else:
+        samples = load_triviaqa(lang=args.lang, seed=config.seed)
+    limit = _opt(args, "limit", None)
+    return samples[:limit] if limit is not None else samples
 
 
 def _load_llm(args, config):
@@ -115,14 +116,14 @@ def _load_llm(args, config):
 
 
 def stage_1_extract(args, config):
-    print(f"\n--- Stage 1: Dynamic Layer Probing & Feature Extraction ---")
+    print("\n--- Stage 1: feature extraction ---")
     print(f"Dataset: {args.dataset} ({args.lang}), Model: {args.model}")
 
     samples = _load_samples(args, config)
     tokenizer, model_llm = _load_llm(args, config)
 
     key = _key(args, tag=False)
-    os.makedirs('results/features', exist_ok=True)
+    ensure_directory("results/features")
     ckpt_path = f'results/features/partial_{key}.npz'
     X_seq, X_glob, y = extract_dataset(samples, tokenizer, model_llm, config, ckpt_path,
                                        batch_size=args.extract_batch_size)
@@ -142,13 +143,13 @@ def stage_1_extract(args, config):
 
 
 def stage_1_extract_v2(args, config):
-    print(f"\n--- Stage 1 (v2): hidden-state vectors, prompt={args.prompt_mode}, views={args.views} ---")
-    print(f"Dataset: {args.dataset} ({args.lang}), Model: {args.model}, quant: {args.quant}")
+    print(f"\n--- Stage 1 (v2): feature extraction, prompt={_opt(args, 'prompt_mode', 'verify')} ---")
+    print(f"Dataset: {args.dataset} ({args.lang}), Model: {args.model}")
     samples = _load_samples(args, config)
     tokenizer, model_llm = _load_llm(args, config)
     views = tuple(v.strip() for v in args.views.split(",") if v.strip())
     out_dir = _feat_dir2(args)
-    extract_dataset_v2(samples, tokenizer, model_llm, config, out_dir, mode=args.prompt_mode,
+    extract_dataset_v2(samples, tokenizer, model_llm, config, out_dir, mode=_opt(args, "prompt_mode", "verify"),
                        views=views, batch_size=args.extract_batch_size)
     del model_llm
     torch.cuda.empty_cache()
@@ -161,18 +162,18 @@ def _v2_context(args, config):
     try:
         d = load_v2(_feat_dir2(args))
     except FileNotFoundError:
-        raise SystemExit(f"v2 features not found in {_feat_dir2(args)}. Run --feat v2 --stage extract first.")
-    keep = rows_to_keep(d["valid"], d["groups"], args.pair_center)
+        raise SystemExit(f"V2 features not found in {_feat_dir2(args)}. Run with --stage extract first.")
+    keep = rows_to_keep(d["valid"], d["groups"], _opt(args, "pair_center", False))
     y, groups = d["y"][keep], d["groups"][keep]
     tr, te = outer_split(y, groups, config.test_size, config.seed, True)
     return d, keep, y, groups, tr, te
 
 
 def stage_2_probe(args, config):
-    print(f"\n--- Stage 2a (v2): out-of-fold linear probes per layer (seed {config.seed}) ---")
+    print(f"\n--- V2 linear probes (seed {config.seed}) ---")
     path = _probe_path(args, config)
-    if os.path.exists(path) and not args.redo_probe:
-        print(f"{path} exists; reusing it (--redo_probe to recompute)")
+    if os.path.exists(path) and not _opt(args, "redo_probe", False):
+        print(f"{path} exists; reusing the cached probes")
         return
     d, keep, y, groups, tr, te = _v2_context(args, config)
     views = d["meta"]["views"]
@@ -180,11 +181,12 @@ def stage_2_probe(args, config):
     if wanted != views:
         raise SystemExit(f"--views {wanted} differs from the extracted views {views}")
     probe, report = run_layer_probes(
-        _feat_dir2(args), views, d["meta"]["L"], keep, y, groups, tr, te, pair_center=args.pair_center,
+        _feat_dir2(args), views, d["meta"]["L"], keep, y, groups, tr, te,
+        pair_center=_opt(args, "pair_center", False),
         n_folds=config.probe_folds, pca_dim=config.probe_pca_dim, C=config.probe_C,
         seed=config.seed, n_jobs=config.probe_jobs)
     print(report)
-    os.makedirs("results/probe", exist_ok=True)
+    ensure_directory("results/probe")
     np.savez(path, probe=probe, views=np.array(views))
     with open(path.replace(".npz", "_auc.txt"), "w") as f:
         f.write(report + "\n")
@@ -192,12 +194,12 @@ def stage_2_probe(args, config):
 
 
 def _load_training_data(args, config):
-    """(X_seq, X_glob, y, groups, train_idx, test_idx, group_split), or None if inputs are missing."""
-    feat = _opt(args, "feat", "v1")
+    """Load feature arrays and their train/test indices."""
+    feat = "v2" if _opt(args, "v2", False) else _opt(args, "feat", "v1")
     pair_center = _opt(args, "pair_center", False)
     group_split = bool(_opt(args, "group_split", False)) or feat == "v2"
     if pair_center and not group_split:
-        raise SystemExit("--pair_center needs --group_split (or --feat v2): both answers of a question must be in the same split")
+        raise SystemExit("--pair_center requires grouped splitting (enabled automatically for v2)")
 
     if feat == "v2":
         d, keep, y, groups, tr, te = _v2_context(args, config)
@@ -209,8 +211,7 @@ def _load_training_data(args, config):
         if use != "none":
             path = _probe_path(args, config)
             if not os.path.exists(path):
-                print(f"{path} not found. Run --feat v2 --stage probe first (same --seed, --views, --pair_center).")
-                return None
+                raise FileNotFoundError(f"{path} not found. Run with --stage extract to create v2 probes.")
             probe = np.load(path)["probe"]                                        # [N, L, V]
             if use in ("both", "seq"):
                 X_seq = np.concatenate([X_seq, probe], axis=-1)
@@ -225,8 +226,7 @@ def _load_training_data(args, config):
         X_glob = np.load(f'results/features/X_glob_{feat_key}.npy')
         y = np.load(f'results/features/y_{feat_key}.npy')
     except FileNotFoundError:
-        print("Features not found. Please run --stage extract first.")
-        return None
+        raise FileNotFoundError("Features not found. Run with --stage extract first.")
     # Added columns come after the original ones, so dropping them is just slicing. This also lets
     # feature files that still carry the old logit-lens channels (seq 14) be reused as they are.
     X_seq = X_seq[:, :, :SEQ_DIM]
@@ -237,8 +237,7 @@ def _load_training_data(args, config):
     if group_split:
         groups = make_groups(_load_samples(args, config))
         if len(groups) != len(y):
-            raise SystemExit(f"{len(y)} feature rows but {len(groups)} samples (failed rows were skipped at "
-                             f"extraction); a group split needs them aligned")
+            raise SystemExit(f"{len(y)} feature rows but {len(groups)} samples; grouped splitting requires aligned rows")
         if pair_center:
             if (np.bincount(groups)[groups] < 2).any():
                 raise SystemExit("--pair_center needs every question to have at least two rows")
@@ -273,14 +272,12 @@ def _train_fold(fold, tr_idx, val_idx, X_seq, X_glob, y, X_seq_test, X_glob_test
 
 
 def stage_2_3_train_oof(args, config):
-    print(f"\n--- Stage 2 & 3: Multi-Scale Modeling & Out-of-Fold Generation ---")
+    print("\n--- Detector training and out-of-fold feature generation ---")
     print(f"seed={config.seed} mixup={config.use_mixup} cutmix={config.use_cutmix} "
           f"layer_delta={config.use_layer_delta} layer_scale={config.scale_layer_weights} "
           f"rank_weight={config.rank_loss_weight} answer_ll={config.use_answer_ll} "
           f"stack={args.stack_mode}")
     data = _load_training_data(args, config)
-    if data is None:
-        return
     X_seq, X_glob, y, groups, tr, te, group_split = data
     print(f"Input features: seq {X_seq.shape[1:]}, global {X_glob.shape[1:]} | "
           f"group_split={group_split} pair_center={_opt(args, 'pair_center', False)}")
@@ -329,7 +326,7 @@ def stage_2_3_train_oof(args, config):
           f"fold-averaged logit (test) {roc_auc_score(y_test, test_logits.mean(axis=0)):.4f}")
 
     key = _key(args)
-    os.makedirs('results/oof', exist_ok=True)
+    ensure_directory("results/oof")
     # "vector" stack mode: 576-d features (test = average over the 5 unrelated feature spaces)
     np.save(f'results/oof/X_train_deep_{key}.npy', oof_features)
     np.save(f'results/oof/X_test_deep_{key}.npy', test_features_accum / config.n_inner_folds)
@@ -346,11 +343,11 @@ def stage_2_3_train_oof(args, config):
             np.save(path, arr)          # question ids, for the grouped stacker folds and pair accuracy
         elif os.path.exists(path):
             os.remove(path)             # stale file of an earlier grouped run
-    print("Stage 2 & 3 completed. OOF outputs saved.")
+    print("Training and OOF generation completed.")
 
 
 def stage_4_ensemble(args, config):
-    print(f"\n--- Stage 4: Log-Odds Ensemble Meta-Learning (stack mode: {args.stack_mode}) ---")
+    print(f"\n--- Ensemble evaluation (stack mode: {args.stack_mode}) ---")
     key = _key(args)
     try:
         y_train = np.load(f'results/oof/y_train_{key}.npy')
@@ -368,8 +365,7 @@ def stage_4_ensemble(args, config):
             # single network's logit, so it is also applied that way; the outputs are averaged below.
             X_tests = [np.column_stack([test_logits[k], glob_test]) for k in range(len(test_logits))]
     except FileNotFoundError:
-        print("OOF outputs not found. Please run --stage train_oof first.")
-        return
+        raise FileNotFoundError("OOF outputs not found. Run with --stage train_oof first.")
 
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
@@ -395,7 +391,7 @@ def stage_4_ensemble(args, config):
         pair_acc, n_pairs = pair_accuracy(probs, y_test, g_test)
         print(f"Pair accuracy (wrong answer scored above the correct one, {n_pairs} questions): {pair_acc:.4f}")
 
-    os.makedirs('results/plots', exist_ok=True)
+    ensure_directory("results/plots")
     plot_path = f"results/plots/results_{key}.png"
     plot_publication_results(
         probs, y_test, (probs >= thresholds['youden']).astype(int),
@@ -405,248 +401,69 @@ def stage_4_ensemble(args, config):
     print(f"Saved results to {plot_path}")
 
 
-def run_rq(args, extra):
-    """Chuyển sang src/rq/rq<N>_<step>.py và ghi MỘT log tổng logs/rq<N>_<YYYYmmdd_HHMMSS>.log.
-
-    --all            : chạy full lưới RQ_GRID (2 model x 4 lang x 2 dataset x 5 seed).
-    không có --all   : chỉ chạy đúng --model / --lang (và --dataset / --seed nếu có truyền);
-                       dataset và seed không truyền thì lấy đủ như mặc định của script RQ.
-    --models/--langs/--datasets/--seeds đưa thẳng vào `extra` luôn được ưu tiên hơn.
-    """
-    root = Path(__file__).resolve().parent
-    # RQ viết trong MỘT file src/rq/rq<N>.py (nhận --step) thì ưu tiên; không có thì dùng rq<N>_<step>.py như cũ.
-    single = root / "src" / "rq" / f"rq{args.rq}.py"
-    script = single if single.exists() else root / "src" / "rq" / f"rq{args.rq}_{args.rq_step}.py"
-    if not script.exists():
-        sys.exit(f"Chưa có {script.relative_to(root)} (RQ{args.rq} bước '{args.rq_step}').")
-
-    if args.all:
-        grid = {k: list(v) for k, v in RQ_GRID.items()}
-    else:
-        grid = {"models": [args.model], "langs": [args.lang]}
-        if args.dataset is not None:
-            grid["datasets"] = [args.dataset]
-        if args.seed is not None:
-            grid["seeds"] = [args.seed]
-    if args.rq_step == "collect":
-        grid.pop("seeds", None)  # rq*_collect không có --seeds
-
-    cmd = [sys.executable, str(script)]
-    if script == single:
-        cmd += ["--step", args.rq_step]
-    cmd += extra
-    for key, vals in grid.items():
-        if f"--{key}" not in extra:
-            cmd += [f"--{key}", *map(str, vals)]
-    if script == single:
-        # run_pipeline đã tự parse các flag này nên không nằm trong `extra`; file RQ đơn cần cả ba (collect cần --views).
-        cmd += ["--views", args.views, "--quant", args.quant, "--stacker", args.stacker,
-                "--extract_batch_size", str(args.extract_batch_size)]
-    elif args.rq_step == "run":
-        # Hai flag này run_pipeline đã tự parse nên không nằm trong `extra`; chỉ rq*_run mới nhận.
-        cmd += ["--extract_batch_size", str(args.extract_batch_size), "--views", args.views,
-                "--quant", args.quant, "--stacker", args.stacker]
-        if args.stack_mode is not None:
-            cmd += ["--stack_mode", args.stack_mode]
-
-    # Cái gì đang chạy (để ghi vào log): flag tường minh trong `extra` thắng, rồi tới grid, rồi mặc định.
-    def shown(key):
-        flag = f"--{key}"
-        if flag in extra:
-            i = extra.index(flag) + 1
-            vals = []
-            while i < len(extra) and not extra[i].startswith("--"):
-                vals.append(extra[i])
-                i += 1
-            return vals
-        return [str(v) for v in grid.get(key, RQ_GRID[key])]
-
-    dry = "--dry_run" in extra
-    log = None
-    if not dry:
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        log_path = root / "logs" / f"rq{args.rq}_{stamp}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log = open(log_path, "w", encoding="utf-8")
-
-    def emit(text):
-        sys.stdout.write(text)
-        sys.stdout.flush()
-        if log:
-            log.write(text)
-            log.flush()
-
-    emit(f"######## RQ{args.rq} | step={args.rq_step} | mode={'ALL' if args.all else 'PARTIAL'} | "
-         f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    emit(f"models   : {' '.join(shown('models'))}\n")
-    emit(f"langs    : {' '.join(shown('langs'))}\n")
-    if args.rq_step != "collect":
-        emit(f"seeds    : {' '.join(shown('seeds'))}\n")
-    emit(f"datasets : {' '.join(shown('datasets'))}\n")
-    emit("$ " + " ".join(cmd) + "\n\n")
-
-    t0 = time.perf_counter()
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    try:
-        proc = subprocess.Popen(cmd, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding="utf-8", errors="replace", bufsize=1)
-        for line in proc.stdout:
-            emit(line)
-        rc = proc.wait()
-    except KeyboardInterrupt:
-        proc.terminate()
-        rc = 130
-        emit("\n[interrupted]\n")
-    emit(f"\n######## done rc={rc} in {time.perf_counter() - t0:.0f}s\n")
-    if log:
-        log.close()
-        print(f"Log tổng: {log_path.relative_to(root)}")
-    sys.exit(rc)
-
-
-def main():
-    # allow_abbrev=False: otherwise a grid flag could be silently matched to a single-run flag by prefix.
-    parser = argparse.ArgumentParser(description="MultiHaluDet 4-Stage Execution Pipeline", allow_abbrev=False)
-    parser.add_argument("--dataset", type=str, default=None, choices=["halueval", "triviaqa"],
-                        help="Dataset (mặc định halueval; với --rq thì không truyền = chạy cả 2 dataset)")
-    parser.add_argument("--lang", type=str, default="en", choices=["en", "fr", "bn", "am", "vi"], help="Language variant of the dataset")
-    parser.add_argument("--model", type=str, default="mistral-7b", choices=PIPELINE_MODELS)
-    parser.add_argument("--stage", type=str, default="all", choices=["all", "extract", "probe", "train_oof", "ensemble"],
-                        help="all: Run full pipeline; extract: Feature Extraction; probe: per-layer linear probes (--feat v2 only); train_oof: Multi-Scale Modeling & OOF; ensemble: Ensemble Meta-Learning")
-    parser.add_argument("--extract_batch_size", type=int, default=4,
-                        help="Batch size for LLM feature extraction; lower it (e.g. 2) if you hit CUDA OOM")
-
-    # Improvements over the base pipeline. With none of these flags the base pipeline runs.
-    parser.add_argument("--improved", action="store_true",
-                        help="Apply everything: --layer_delta --layer_scale --rank_weight 0.1 --answer_ll --stack_mode logit")
-    parser.add_argument("--layer_delta", action="store_true",
-                        help="Add layer-to-layer delta channels to the sequential input")
-    parser.add_argument("--layer_scale", action="store_true",
-                        help="Scale the softmax layer weights by the number of layers")
-    parser.add_argument("--rank_weight", type=float, default=None,
-                        help="Weight of the pairwise AUC loss (default 0 = off)")
-    parser.add_argument("--answer_ll", action="store_true",
-                        help="Use the 4 answer log-likelihood features (global 30 -> 34)")
-    parser.add_argument("--stack_mode", type=str, default=None, choices=["logit", "vector"],
-                        help="vector (default): stack the 576-d features; logit: stack fold-network logits + global features")
-
-    # Feature set v2 (hidden-state probes), split and stacker options. Defaults keep the v1 behaviour.
-    parser.add_argument("--feat", type=str, default="v1", choices=["v1", "v2"],
-                        help="v1: scalar statistics only (original); v2: also keep hidden-state vectors, "
-                             "train per-layer linear probes and feed their logits to the model")
-    parser.add_argument("--prompt_mode", type=str, default="verify", choices=["plain", "verify"],
-                        help="v2 prompt: plain = 'Question/Answer'; verify = adds 'Is the proposed answer correct?' "
-                             "and reads the hidden state / Yes-No logits at the last token")
-    parser.add_argument("--views", type=str, default="last,amean",
-                        help=f"v2 hidden-state views to store and probe, comma separated, from {','.join(VIEWS)} "
-                             f"(each view costs ~2.6 GB per run for a 32-layer 4096-d model)")
-    parser.add_argument("--quant", type=str, default="4bit", choices=["4bit", "8bit", "fp16"],
-                        help="Precision of the LLM during extraction (8bit/fp16 need more GPU memory)")
-    parser.add_argument("--probe_use", type=str, default="both", choices=["both", "seq", "glob", "none"],
-                        help="v2: where the probe logits go: sequential channels, global summaries, both, or nowhere (ablation)")
-    parser.add_argument("--glob_use", type=str, default="base,ll,yn",
-                        help="v2: nhóm cột global đưa vào mô hình, cách nhau bằng dấu phẩy, từ base (30 cột v1), "
-                             "ll (13 cột answer-LL/PMI), yn (3 cột Yes/No, chỉ có với --prompt_mode verify); dùng cho ablation RQ1")
-    parser.add_argument("--pca_dim", type=int, default=None, help="PCA dimension of each probe (default config: 256)")
-    parser.add_argument("--probe_C", type=float, default=None, help="Inverse L2 strength of each probe (default config: 0.02)")
-    parser.add_argument("--probe_jobs", type=int, default=None, help="Probes fitted in parallel (default config: 4)")
-    parser.add_argument("--redo_probe", action="store_true", help="Recompute the probes even if their file exists")
-    parser.add_argument("--group_split", action="store_true",
-                        help="Split by question so both answers of a question stay together (always on with --feat v2)")
-    parser.add_argument("--pair_center", action="store_true",
-                        help="Subtract the per-question mean from every feature (and from the probe inputs). Needs both "
-                             "answers of a question at test time, so it changes what is being evaluated")
-    parser.add_argument("--stacker", type=str, default="full", choices=["full", "lite"],
-                        help="full: the 6 base classifiers; lite: logistic regression + LightGBM only")
-    parser.add_argument("--hidden_dim", type=int, default=None, help="Override config.hidden_dim (must divide by num_heads=8)")
-    parser.add_argument("--num_layers", type=int, default=None, help="Override the number of transformer layers")
-    parser.add_argument("--dropout", type=float, default=None, help="Override config.dropout")
-
-    # Run management
-    parser.add_argument("--seed", type=int, default=None, help="Override config.seed (changes the split and the folds)")
-    parser.add_argument("--tag", type=str, default="",
-                        help="Suffix for OOF/plot files so several runs (seeds, variants) do not overwrite each other")
-    parser.add_argument("--no_mixup", action="store_true", help="Disable Mixup")
-    parser.add_argument("--no_cutmix", action="store_true", help="Disable CutMix")
-
-    # Research-question grids: delegate to src/rq/rq<N>_<step>.py
-    parser.add_argument("--rq", type=int, choices=[1, 2], default=None,
-                        help="Chạy lưới thí nghiệm RQ<N> (model x lang x dataset x seed) thay vì pipeline đơn lẻ; "
-                             "các flag còn lại (--models, --langs, --seeds, --dry_run, ...) được chuyển cho script RQ")
-    parser.add_argument("--all", action="store_true",
-                        help="Với --rq: chạy full lưới 2 model x 4 lang x 2 dataset x 5 seed "
-                             "(không có --all thì chỉ chạy --model/--lang/--dataset/--seed đã truyền)")
-    parser.add_argument("--rq_step", type=str, default="run", choices=RQ_STEPS,
-                        help="run: chạy lưới; collect: gom log thành CSV; diagnostics: chẩn đoán answer-LL")
-    args, extra = parser.parse_known_args()
-
-    # Must come before the --improved block below: that block defaults stack_mode to "vector",
-    # whereas rq*_run.py defaults to "logit".
-    if args.rq is not None:
-        run_rq(args, extra)  # never returns
-    if extra:
-        parser.error(f"unrecognized arguments: {' '.join(extra)}")
-
-    if args.all:
-        parser.error("--all chỉ dùng cùng --rq")
-    if args.dataset is None:
-        args.dataset = "halueval"
-
-    if args.improved:
-        args.layer_delta = args.layer_scale = args.answer_ll = True
-        if args.rank_weight is None:
-            args.rank_weight = 0.1
-        if args.stack_mode is None:
-            args.stack_mode = "logit"
-    if args.stack_mode is None:
-        args.stack_mode = "vector"
+def run_model(args):
+    args.views = "last,amean"
+    args.prompt_mode = "verify"
+    args.probe_use = "both"
+    args.glob_use = "base,ll,yn"
+    args.pair_center = False
+    args.stack_mode = "vector"
+    args.extract_batch_size = 4
 
     config = get_config()
-    if args.seed is not None:
-        config.seed = args.seed
-    if args.no_mixup:
-        config.use_mixup = False
-    if args.no_cutmix:
-        config.use_cutmix = False
-    config.use_layer_delta = args.layer_delta
-    config.scale_layer_weights = args.layer_scale
-    config.use_answer_ll = args.answer_ll
-    if args.rank_weight is not None:
-        config.rank_loss_weight = args.rank_weight
-
-    if args.hidden_dim is not None:
-        if args.hidden_dim % config.num_heads:
-            parser.error(f"--hidden_dim must be a multiple of {config.num_heads}")
-        config.hidden_dim = args.hidden_dim
-    if args.num_layers is not None:
-        config.num_layers = args.num_layers
-    if args.dropout is not None:
-        config.dropout = args.dropout
-    if args.pca_dim is not None:
-        config.probe_pca_dim = args.pca_dim
-    if args.probe_C is not None:
-        config.probe_C = args.probe_C
-    if args.probe_jobs is not None:
-        config.probe_jobs = args.probe_jobs
-
-    v2 = args.feat == "v2"
-    if args.stage == "probe" and not v2:
-        parser.error("--stage probe needs --feat v2")
-    if args.pair_center and not (v2 or args.group_split):
-        parser.error("--pair_center needs --group_split (or --feat v2)")
-
+    config.seed = args.seed
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
 
-    if args.stage in ["extract", "all"]:
-        (stage_1_extract_v2 if v2 else stage_1_extract)(args, config)
-    if v2 and args.probe_use != "none" and args.stage in ["probe", "all"]:
-        stage_2_probe(args, config)
-    if args.stage in ["train_oof", "all"]:
+    if args.stage in ("extract", "all"):
+        (stage_1_extract_v2 if args.v2 else stage_1_extract)(args, config)
+        if args.v2:
+            stage_2_probe(args, config)
+    if args.stage in ("train_oof", "all"):
         stage_2_3_train_oof(args, config)
-    if args.stage in ["ensemble", "all"]:
+    if args.stage in ("ensemble", "all"):
         stage_4_ensemble(args, config)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract features, train the detector, and evaluate its ensemble.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--v2", action="store_true",
+                        help="Use v2 hidden-state features and probes (default: Base features).")
+    parser.add_argument("--models", nargs="+", choices=PIPELINE_MODELS, default=["mistral-7b"],
+                        help="One or both supported models (default: mistral-7b).")
+    parser.add_argument("--dataset", choices=["halueval", "triviaqa"], default="halueval",
+                        help="Dataset to process (default: halueval).")
+    parser.add_argument("--lang", choices=["en", "fr", "bn", "am", "vi"], default="en",
+                        help="Dataset language (default: en).")
+    parser.add_argument("--stage", choices=["extract", "train_oof", "ensemble", "all"], default="all",
+                        help="extract includes v2 probes; all runs every stage (default: all).")
+    parser.add_argument("--limit", type=int, help="Process at most this many dataset records (positive integer).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
+    args = parser.parse_args()
+
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be a positive integer.")
+
+    os.chdir(ROOT_DIR)
+    for model in args.models:
+        args.model = model
+        family = "mistral" if model.startswith("mistral") else "llama"
+        variant = "v2" if args.v2 else "base"
+        log_path = ROOT_DIR / "logs" / family / (
+            f"{args.dataset}_{args.lang}_{variant}_s{args.seed}.log"
+        )
+        with capture_run_log(log_path):
+            print(f"Model: {model}")
+            print(f"Dataset: {args.dataset} | language: {args.lang} | features: {variant}")
+            limit_text = args.limit if args.limit is not None else "all"
+            print(f"Stage: {args.stage} | seed: {args.seed} | limit: {limit_text}")
+            run_model(args)
+        print(f"Log saved to {log_path.relative_to(ROOT_DIR)}")
+
 
 if __name__ == "__main__":
     main()

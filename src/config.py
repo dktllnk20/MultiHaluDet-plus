@@ -43,8 +43,7 @@ class Config:
     swa_start = 30
     swa_lr = 5e-5
     
-    # Improvements, all OFF by default (= base). run_pipeline.py switches them on with --improved
-    # or one by one (--layer_delta, --layer_scale, --rank_weight, --answer_ll, --stack_mode logit).
+    # Optional architecture and loss changes are disabled by default.
     use_layer_delta = False      # add x_l - x_(l-1) channels to the sequential input (12 -> 24)
     scale_layer_weights = False  # softmax layer weights times L, so initialisation is identity
     rank_loss_weight = 0.0       # weight of the pairwise AUC loss; 0 disables it
@@ -59,7 +58,7 @@ class Config:
     focal_alpha_neg = 0.5
     focal_gamma = 2.0
 
-    # Feature set v2 (run_pipeline.py --feat v2): linear probes on hidden-state vectors.
+    # Feature set v2 (run_pipeline.py --v2): linear probes on hidden-state vectors.
     probe_pca_dim = 256   # PCA components per (view, layer) before the logistic regression
     probe_C = 0.02        # inverse L2 strength of the probe
     probe_folds = 5       # out-of-fold folds of the probes (grouped by question)

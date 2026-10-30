@@ -1,8 +1,6 @@
-"""Out-of-fold linear probes on hidden-state vectors, one per (view, layer).
-
-Each probe is StandardScaler -> PCA(pca_dim) -> LogisticRegression. Train rows get out-of-fold
-decision values (folds are grouped by question), test rows the average over the fold probes, so no
-row is scored by a probe that saw its label or its sibling answer.
+"""Fits out-of-fold linear probes to each hidden-state view and layer.
+The run_pipeline.py extraction stage calls this module for v2 feature runs.
+It returns probe scores for the training stage and a per-layer AUC report.
 """
 import os
 

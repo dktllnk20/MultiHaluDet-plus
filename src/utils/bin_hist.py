@@ -1,41 +1,6 @@
-"""Surface-shortcut figures on HaluEval: hallucination rate by answer length (Fig 4a)
-and by "ends with period" (Fig 4b).
-
-Location : root/src/utils/bin_hist.py
-Input    : root/data/halueval_en.json  (JSON list or JSONL)
-Output   : root/results/img/*.png
-
-Fig 4a: x axis -> answer-length bin, y axis -> % of answers in that bin that are
-        hallucinated, with the percentage printed on top of each bar (n under the label).
-Fig 4b: x axis -> "Ends with period" (Yes / No), same y axis, same style, n per group.
-
-Usage (from root):
-    python src/utils/bin_hist.py                      # both figures (4a: 5 quantile bins, word length; 4b)
-    python src/utils/bin_hist.py --fig a --n-bins 7   # only Fig 4a, 7 bins
-    python src/utils/bin_hist.py --fig b              # only Fig 4b (period Yes/No)
-    python src/utils/bin_hist.py --n-bins 8
-    python src/utils/bin_hist.py --n-bins 10 --mode uniform --unit char
-    python src/utils/bin_hist.py --unit token --tokenizer mistralai/Mistral-7B-v0.1
-    python src/utils/bin_hist.py --theme orange          # solid color theme
-    python src/utils/bin_hist.py --theme YlOrRd          # gradient: color follows the rate
-    python src/utils/bin_hist.py --theme "#8E44AD"       # any hex color
-    python src/utils/bin_hist.py --horizontal            # horizontal bars (both figures)
-    python src/utils/bin_hist.py --style dark --theme plasma
-    python src/utils/bin_hist.py --horizontal --style paper --theme navy --title
-
-Look & feel = two independent knobs:
-    --theme  bar colors (solid name | matplotlib colormap | hex)
-    --style  figure look: default | clean | paper | soft | dark
-
-From other code:
-    from src.utils.bin_hist import plot_length_bin_hist, plot_period_hist
-    plot_length_bin_hist(n_bins=6, horizontal=True, style="clean")
-    plot_period_hist(horizontal=True, style="clean")
-
-Supported record layouts (auto-detected, or force with --answer-key/--label-key):
-  1. Paired  : {"right_answer": ..., "hallucinated_answer": ...}
-               -> each record yields 2 samples (label 0 and label 1)
-  2. Flat    : {"answer": ..., "label": 0/1 | "yes"/"no" | true/false}
+"""Plots answer-length and punctuation correlations with hallucination labels.
+The utility reads HaluEval records and saves charts for standalone dataset analysis.
+Run it directly when creating exploratory figures; the main pipeline does not call it.
 """
 from __future__ import annotations
 

@@ -5,8 +5,10 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from src.settings.runtime import ensure_parent
+
 # Feature layout. The first GLOB_BASE_DIM global columns are the original features; the last 4 are
-# the answer log-likelihood statistics, which run_pipeline.py drops unless --answer_ll is given.
+# the answer log-likelihood statistics, which the pipeline omits when config.use_answer_ll is false.
 SEQ_DIM = 12                    # 10 last-token statistics + 2 mean-over-tokens statistics
 GLOB_BASE_DIM = 30
 GLOB_DIM = GLOB_BASE_DIM + 4    # + answer-span log-likelihood statistics
@@ -168,6 +170,7 @@ def extract_dataset(samples, tokenizer, model_llm, config, ckpt_path,
     max_fail_frac failed samples aborts the run. The caller deletes ckpt_path
     after it has saved the result.
     """
+    ensure_parent(ckpt_path)
     all_seq, all_glob, all_labels = [], [], []
     start = n_failed = 0
     if os.path.exists(ckpt_path):
@@ -188,7 +191,7 @@ def extract_dataset(samples, tokenizer, model_llm, config, ckpt_path,
             seq, glob = extract_features([b["question"] for b in batch],
                                          [b["answer"] for b in batch],
                                          tokenizer, model_llm, config)
-        # ponytail: a failed batch drops all its samples; retry them one by one if that costs data
+        # A failed batch is skipped; successful batches continue accumulating below.
         except Exception as e:
             n_failed += len(batch)
             print(f"[extract] samples {i}-{i + len(batch) - 1} failed: {type(e).__name__}: {e}")

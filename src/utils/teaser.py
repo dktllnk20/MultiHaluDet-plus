@@ -1,17 +1,6 @@
-"""Horizontal grouped bar chart: Base vs Ours AUC on 4 languages (en, fr, vi, bn).
-
-Location : root/src/utils/compare_bar.py
-Output   : root/results/img/compare_<model>.png
-
-y axis -> languages (en, fr, vi, bn), x axis -> AUC, 2 bars per language:
-Base (blue) and Ours (orange), value printed at the end of each bar.
-Bar value = mean over seeds (computed from the per-seed numbers below).
-
-Usage (from root):
-    python src/utils/compare_bar.py                       # one figure per model
-    python src/utils/compare_bar.py --combined            # + a side-by-side figure
-    python src/utils/compare_bar.py --models mistral-7b   # only one model
-    python src/utils/compare_bar.py --xmin 0.9 --err      # wider x range + std error bars
+"""Plots grouped AUC comparisons between baseline and proposed models.
+This standalone utility reads the results embedded in this module and saves figures.
+Run it directly; no pipeline stage imports it.
 """
 from __future__ import annotations
 

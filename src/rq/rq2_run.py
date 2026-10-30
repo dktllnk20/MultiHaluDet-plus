@@ -1,26 +1,6 @@
-"""RQ2 -- Phan lon AUROC cua bo phat hien dua tren hidden state tren HaluEval co the duoc giai thich
-boi dac diem be mat cua cau tra loi (do dai, van phong) khong?
-
-Chay qua run_pipeline.py (log tong nam o logs/rq2_<time>.log do run_pipeline ghi):
-
-    python run_pipeline.py --rq 2                                    # mistral-7b, en, halueval, 5 seed
-    python run_pipeline.py --rq 2 --models mistral-7b llama2-7b      # ca 2 model (van chi en)
-    python run_pipeline.py --rq 2 --seed 1                           # chay thu 1 seed
-    python run_pipeline.py --rq 2 --skip b3 hs --dry_run             # xem ke hoach, khong chay
-
-    python run_pipeline.py --rq 2 --datasets triviaqa --models mistral-7b llama2-7b   # shortcut tren TriviaQA da curate
-Ket qua: results/rq2/<dataset>_<lang>_<model>/  va  results/rq2/summary_all.csv
-
-Cac thanh phan
-  B0  chi do dai (LR, GBM)                 B1  thong ke van phong thu cong (LR, GBM)
-  B2  TF-IDF word/char + LR, che do answer-only / question-only / question+answer
-  B3  XLM-R fine-tune chi tren answer (tuy chon, can GPU)
-  hs  mo hinh hidden-state cua kien truc moi (run_pipeline --feat v2: verify prompt, probe, A/B/C = dieu kien
-      `full` cua RQ1; goi lai stage probe/train_oof/ensemble, CUNG split nhom theo cau hoi + seed, dung lai OOF cua RQ1)
-Thi nghiem co che
-  length-bin / length-matched AUROC, complementarity (stack be mat + hidden), residualize
-  (loai thanh phan tuyen tinh cua be mat khoi feature hidden roi train lai), perturbation,
-  importance cua B1 (permutation + SHAP neu co), n-gram quan trong nhat cua B2.
+"""Runs RQ2 experiments on answer-surface shortcuts and hidden-state detector features.
+The workflow compares text baselines with cached pipeline features and reports CSV summaries.
+It imports run_pipeline.py stages for the hidden-state experiments.
 """
 from __future__ import annotations
 
@@ -49,7 +29,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-# src/rq/rq2_run.py -> root. run_pipeline chay script voi cwd=root nhung sys.path[0] la src/rq.
+# This file is under src/rq; add the repository root because Python starts with src/rq on sys.path.
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -95,7 +75,7 @@ def _is_punct(ch: str) -> bool:
 
 
 def make_token_counter(model_key: str):
-    """Dem token bang tokenizer cua chinh LLM (dung la thu hidden state nhin thay)."""
+    """Count tokens with the selected LLM tokenizer, matching the model's actual input."""
     try:
         from transformers import AutoTokenizer
         from src.config import MODEL_REGISTRY
@@ -106,8 +86,8 @@ def make_token_counter(model_key: str):
             return np.array([len(x) for x in ids])
         return count
     except Exception as e:  # noqa: BLE001
-        print(f"[warn] khong nap duoc tokenizer cua {model_key} ({type(e).__name__}: {e}); "
-              f"dung xap xi 1.3 x so tu", flush=True)
+        print(f"[warning] Could not load the {model_key} tokenizer ({type(e).__name__}: {e}); "
+              "using an estimate of 1.3 tokens per word.", flush=True)
         return lambda texts: np.array([int(round(len(_WORD.findall(t)) * 1.3)) for t in texts])
 
 
@@ -186,7 +166,7 @@ def fast_auc(y, s) -> float:
 
 
 def paired_boot(y, a, b, n=1000, seed=0):
-    """Bootstrap theo cap tren cung tap test: mean, 2.5%, 97.5% cua AUC(a) - AUC(b)."""
+    """Bootstrap paired AUROC differences on one test set; return the mean and 95% interval."""
     rng = np.random.default_rng(seed)
     y, a, b = np.asarray(y), np.asarray(a), np.asarray(b)
     d = []
@@ -224,7 +204,7 @@ def gbm_scores(Ztr, ytr, Zte, seed, extra_tr=None, extra_te=None):
 
 
 def lr_scores(Ztr, ytr, Zte, seed, extra_tr=None, extra_te=None):
-    """Feature be mat deu >= 0 va lech phai nen log1p truoc; `extra` (diem hidden) giu nguyen."""
+    """Apply log1p to nonnegative, right-skewed surface features; leave hidden scores unchanged."""
     def prep(Z, extra):
         L = np.log1p(Z)
         return L if extra is None else np.column_stack([extra, L])
@@ -239,7 +219,7 @@ def tfidf_scores(q_tr, a_tr, y_tr, q_te, a_te, mode, analyzer, seed):
         if analyzer == "word":
             return TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True,
                                    token_pattern=r"(?u)\b\w+\b", max_features=300000)
-        # giu nguyen hoa/thuong de bat duoc van phong
+        # Preserve case so stylistic capitalization remains measurable.
         return TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=2, sublinear_tf=True,
                                lowercase=False, max_features=300000)
     srcs = {"answer": [("a", a_tr, a_te)], "question": [("q", q_tr, q_te)],
@@ -253,7 +233,7 @@ def tfidf_scores(q_tr, a_tr, y_tr, q_te, a_te, mode, analyzer, seed):
     Xtr, Xte = sparse.hstack(btr).tocsr(), sparse.hstack(bte).tocsr()
     clf = LogisticRegressionCV(Cs=[0.1, 0.3, 1, 3, 10], cv=3, scoring="roc_auc", solver="liblinear",
                                max_iter=1000, random_state=seed)
-    clf.fit(Xtr, y_tr)  # C chon bang CV tren train, khong dung test
+    clf.fit(Xtr, y_tr)  # Select C by cross-validation on training data only.
     return clf.decision_function(Xte), clf, names
 
 
@@ -279,7 +259,7 @@ def b1_importance(model, Zte, yte, seed) -> pd.DataFrame:
 
 
 def baseline_scores(Z, Q, A, tr, te, y, seed, full, want_b2=True):
-    """B0/B1/B2 tren split (tr, te). full=False: chi 4 baseline re (dung cho perturbation)."""
+    """Fit B0/B1/B2 on one split; full=False limits work to the four lightweight baselines."""
     ytr = y[tr]
     Q, A = np.asarray(Q, dtype=object), np.asarray(A, dtype=object)
     preds, extras = {}, {}
@@ -314,7 +294,7 @@ def b3_scores(a_tr, y_tr, a_te, seed, args):
     use_amp = dev.type == "cuda"
     tok = AutoTokenizer.from_pretrained(args.b3_model)
     model = AutoModelForSequenceClassification.from_pretrained(args.b3_model, num_labels=1).to(dev)
-    # Bang embedding cua XLM-R (250k x 768) chiem ~70% tham so: dong bang de vua GPU 6 GB.
+    # XLM-R's embedding table (250k x 768) uses about 70% of the parameters; freeze it for 6 GB GPUs.
     for n, p in model.named_parameters():
         if "word_embeddings" in n:
             p.requires_grad = False
@@ -371,9 +351,8 @@ def b3_scores(a_tr, y_tr, a_te, seed, args):
 
 
 # ----------------------------------------------------------------------------------------------
-# Hidden-state model: kien truc moi (run_pipeline --feat v2). Cau hinh = dieu kien RQ1 `--hs_cond`
-# (full = bat het A/B/C; base = tat het), lay tu cond_spec cua src/rq/rq1.py de hai RQ dong bo.
-# Tag train/OOF trung voi RQ1 (tr_<sig>_s<seed>) nen feature, probe va OOF cua RQ1 duoc dung lai.
+# Hidden-state model: reuse the v2 pipeline configuration from the selected RQ1 condition.
+# The shared training/OOF tag lets both research workflows reuse matching features and probes.
 # ----------------------------------------------------------------------------------------------
 _RP = None
 _R1 = None
@@ -393,7 +372,7 @@ def _r1():
         try:
             import src.rq.rq1 as r1
         except ImportError as e:
-            raise SystemExit(f"Khong import duoc src/rq/rq1.py ({e}); RQ2 dung cond_spec/ALL_CONDS cua RQ1")
+            raise SystemExit(f"Could not import src/rq/rq1.py ({e}); RQ2 requires its condition definitions.")
         _R1 = r1
     return _R1
 
@@ -412,7 +391,7 @@ def hs_spec(args):
 
 
 def hs_config(seed, comps):
-    """Giong cach run_pipeline.main() dat config tu cac co cua dieu kien."""
+    """Build the training configuration for an RQ1 component condition."""
     cfg = base_cfg(seed)
     cfg.use_layer_delta = "C_delta" in comps
     cfg.scale_layer_weights = "C_scale" in comps
@@ -421,8 +400,8 @@ def hs_config(seed, comps):
 
 
 def hs_ns(dataset_key, lang, model, seed, spec, args):
-    """Namespace day du cho cac stage v2 cua run_pipeline (stage 2/3/4 doc truc tiep args.<ten>)."""
-    prefix = "rq2_" if args.no_reuse else ""      # --no_reuse: khong ghi de OOF cua RQ1
+    """Build the arguments required by the v2 pipeline stages."""
+    prefix = "rq2_" if args.no_reuse else ""      # --no_reuse keeps RQ1 OOF files untouched.
     return argparse.Namespace(
         dataset=dataset_key, lang=lang, model=model, tag=f"{prefix}tr_{spec['sig']}_s{seed}",
         feat="v2", prompt_mode=spec["pm"], views=args.views, quant=args.quant,
@@ -436,18 +415,18 @@ def feat_dir(ns) -> Path:
 
 
 def ensure_features_v2(ns, args, cfg, samples=None):
-    """Dam bao results/features_v2/<ds>_<lang>_<model>_<prompt>/ da trich xong (views khop --views)."""
+    """Ensure v2 features exist and use the requested views."""
     rp = _rp()
     d = feat_dir(ns)
     views = [v.strip() for v in args.views.split(",") if v.strip()]
     if (d / "y.npy").exists() and (d / "meta.json").exists():
         have = json.loads((d / "meta.json").read_text())["views"]
         if have != views:
-            raise RuntimeError(f"{d}: views da trich {have} != --views {views}")
+            raise RuntimeError(f"{d}: extracted views {have} do not match requested views {views}")
         return
-    print(f"[hs] trich feature v2 {d.name} ...", flush=True)
+    print(f"[hs] Extracting v2 features for {d.name} ...", flush=True)
     orig = rp._load_samples
-    if samples is not None:     # dataset 'halueval-p-*' / 'halueval-resid*' khong co loader rieng
+    if samples is not None:     # Synthetic HaluEval variants have no dedicated loader.
         rp._load_samples = lambda a, c: samples
     try:
         rp.stage_1_extract_v2(ns, cfg)
@@ -456,8 +435,8 @@ def ensure_features_v2(ns, args, cfg, samples=None):
 
 
 def get_split(ns, cfg, samples, use_feat):
-    """Split cua pipeline v2: bo hang extraction loi (valid), GroupShuffleSplit theo cau hoi.
-    Khong co feature (--skip hs) thi gia dinh moi hang deu hop le -> co the lech split cua hs neu extraction co hang loi."""
+    """Use the v2 pipeline's valid rows and question-group split.
+    Without features, assume all rows are valid; failed extraction rows can change the split."""
     if use_feat:
         d, keep, y, groups, tr, te = _rp()._v2_context(ns, cfg)
         return dict(keep=keep, y=y, groups=groups, tr=tr, te=te)
@@ -478,25 +457,24 @@ def hs_is_cached(ns, args):
 
 
 def run_hs(ns, cfg, spec, args, y_exp, g_exp):
-    """Probe -> train_oof -> ensemble cua pipeline v2 cho 1 seed (hoac doc cache).
-    Tra ve dict: final (xac suat stacker), deep (logit TB 5 fold net), oof (logit OOF train), y_train, y_test, g_test."""
+    """Run or load the v2 probe, training, and ensemble stages for one seed."""
     rp = _rp()
     key, cache = hs_cache_path(ns, args)
     cache.parent.mkdir(parents=True, exist_ok=True)
     if cache.exists() and not args.no_reuse:
         d = np.load(cache)
         out = {k: d[k] for k in d.files}
-        print(f"  [hs] doc cache {cache.name}", flush=True)
+        print(f"  [hs] Loading cache {cache.name}", flush=True)
     else:
         if spec["probe"] != "none":
-            rp.stage_2_probe(ns, cfg)           # dung lai file probe neu da co (RQ1 da tao)
+            rp.stage_2_probe(ns, cfg)           # Reuse the cached probe created by RQ1 when available.
         needed = ["oof_logits", "test_logits", "X_glob_train", "X_glob_test", "y_train", "y_test", "g_train", "g_test"]
         if ns.stack_mode == "vector":
             needed += ["X_train_deep", "X_test_deep"]
         if not all(Path(f"results/oof/{n}_{key}.npy").exists() for n in needed):
             rp.stage_2_3_train_oof(ns, cfg)
         cap, orig = {}, rp.plot_publication_results
-        # stage_4_ensemble khong tra ve xac suat -> bat lai tham so dau cua ham ve hinh
+        # Capture scores from the plot callback because stage_4_ensemble returns no probabilities.
         rp.plot_publication_results = lambda probs, labels, *a, **k: cap.update(
             probs=np.asarray(probs), y=np.asarray(labels))
         try:
@@ -504,7 +482,7 @@ def run_hs(ns, cfg, spec, args, y_exp, g_exp):
         finally:
             rp.plot_publication_results = orig
         if "probs" not in cap:
-            raise RuntimeError(f"stage 4 khong tao ra xac suat cho {key} (thieu feature/probe/OOF?)")
+            raise RuntimeError(f"Stage 4 produced no probabilities for {key}; features, probes, or OOF data may be missing.")
         out = dict(final=cap["probs"],
                    deep=np.load(f"results/oof/test_logits_{key}.npy").mean(0),
                    oof=np.load(f"results/oof/oof_logits_{key}.npy"),
@@ -513,14 +491,15 @@ def run_hs(ns, cfg, spec, args, y_exp, g_exp):
                    g_test=np.load(f"results/oof/g_test_{key}.npy"))
         np.savez(cache, **out)
     if not (np.array_equal(out["y_test"], y_exp) and np.array_equal(out["g_test"], g_exp)):
-        raise RuntimeError("tap test cua pipeline khac split cua RQ2 -> khong so sanh cung split duoc")
+        raise RuntimeError("The pipeline test set differs from the RQ2 split; results are not comparable.")
     return out
 
 
 def write_resid_v2(Z, fit_rows, test_rows, ns_src, ns_dst, ridge=1.0):
-    """Residualize feature v2: hoi quy ridge (fit CHI tren hang train hop le) tung chieu cua hidden state
-    (H_<view>, tung layer), seq.npy va glob.npy theo feature be mat roi tru di. Ghi vao thu muc feature
-    moi (cung N/valid/groups/y nen split giong het). fit_rows/test_rows la chi so hang THO (truoc keep)."""
+    """Residualize v2 hidden-state and scalar features against surface features.
+    Fit ridge regression on valid training rows only and write transformed features separately.
+    fit_rows and test_rows index raw rows before invalid extractions are removed.
+    """
     import shutil
     from numpy.lib.format import open_memmap
     src, dst = feat_dir(ns_src), feat_dir(ns_dst)
@@ -571,8 +550,7 @@ def cleanup_resid(ns):
 # Analyses
 # ----------------------------------------------------------------------------------------------
 def length_analysis(y, length, preds, n_bins, seed, n_rep=20) -> pd.DataFrame:
-    """AUROC trong tung bin do dai (theo phan vi cua tap test), trung binh co trong so,
-    va AUROC tren tap con da can bang nhan trong tung bin (length-matched)."""
+    """Compute per-length-bin AUROC, weighted AUROC, and label-balanced AUROC."""
     y, length = np.asarray(y), np.asarray(length)
     edges = np.unique(np.quantile(length, np.linspace(0, 1, n_bins + 1)))
     bins = np.digitize(length, edges[1:-1])
@@ -610,8 +588,9 @@ def length_analysis(y, length, preds, n_bins, seed, n_rep=20) -> pd.DataFrame:
 
 
 def complementarity(Z, tr, te, y, hs, seed, boot):
-    """Stack diem hidden (OOF logit cua deep net) voi feature be mat va do Delta AUROC (bootstrap theo cap).
-    Luu y: tren train la OOF cua 1 net, tren test la trung binh 5 net nen phan phoi hoi khac nhau."""
+    """Stack hidden scores with surface features and estimate the AUROC change by paired bootstrap.
+    Training scores are OOF from one network; test scores average five networks.
+    """
     ytr, yte = y[tr], y[te]
     s_tr, s_te = hs["oof"][:, None], hs["deep"][:, None]
     rows, scores = [], {}
@@ -628,8 +607,7 @@ def complementarity(Z, tr, te, y, hs, seed, boot):
 
 
 def write_pair_length_stats(out: Path, y, groups, tok, words):
-    """Chenh lech do dai trong tung cap (cau tra loi sai - dung): co the do duoc shortcut ma khong can model.
-    Chi tinh tren cac cau hoi co du 2 nhan."""
+    """Measure wrong-minus-correct answer length within questions that have both labels."""
     rows = []
     for name, v in (("tokens", tok), ("words", words)):
         longer = shorter = equal = 0
@@ -651,7 +629,7 @@ def write_pair_length_stats(out: Path, y, groups, tok, words):
     if rows:
         df = pd.DataFrame(rows)
         df.to_csv(out / "pair_length_stats.csv", index=False)
-        print("[pair-length] sai - dung, theo cap:\n" + df.to_string(index=False), flush=True)
+        print("[pair-length] wrong minus correct, paired by question:\n" + df.to_string(index=False), flush=True)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -664,7 +642,7 @@ def run_combo(args, model, lang, ds="halueval"):
     out = RESULTS / f"{ds}_{lang}_{model}"
     out.mkdir(parents=True, exist_ok=True)
     t_combo = time.perf_counter()
-    # TriviaQA: 2 hang / cau hoi (dung, sai); load_triviaqa chi lay ngau nhien khi > max_samples (4952 cap = 9904 hang < 10000 nen khong cat cap)
+    # TriviaQA has two rows per question; its loader samples only above max_samples.
     samples = load_halueval(lang=lang) if ds == "halueval" else load_triviaqa(lang=lang, seed=42)
     Q = [s["question"] for s in samples]
     A = [s["answer"] for s in samples]
@@ -682,7 +660,8 @@ def run_combo(args, model, lang, ds="halueval"):
         ensure_features_v2(ns0, args, hs_config(args.seeds[0], comps))
         y_feat = np.load(feat_dir(ns0) / "y.npy")
         if len(y_feat) != len(y) or not np.array_equal(y_feat, y):
-            print(f"[error] feature da trich ({len(y_feat)}) khong khop mau ({len(y)}). Bo qua to hop nay.", flush=True)
+            print(f"[error] Extracted feature count ({len(y_feat)}) does not match sample count "
+                  f"({len(y)}); skipping this combination.", flush=True)
             return False
 
     count_tokens = make_token_counter(model)
@@ -718,7 +697,7 @@ def run_combo(args, model, lang, ds="halueval"):
 
         preds, extras = baseline_scores(Zk, Qk, Ak, tr, te, yk, seed, full=True, want_b2="b2" not in args.skip)
 
-        for j, c in enumerate(ALL_COLS):  # AUROC co dau cua tung feature don le (>0.5: cang lon -> hallucination)
+        for j, c in enumerate(ALL_COLS):  # Signed AUROC for each feature; above 0.5 means higher values predict hallucination.
             single_rows.append(dict(seed=seed, feature=c, auc=fast_auc(yte, Zk[te][:, j]) if Zk[te][:, j].std() > 0 else np.nan))
         for k, df_ in extras.items():
             if k.startswith("top_"):
@@ -727,7 +706,7 @@ def run_combo(args, model, lang, ds="halueval"):
             d = b1_importance(extras["b1_gbm_model"], Zk[te], yte, seed)
             d.insert(0, "seed", seed)
             imp_rows.append(d)
-            # he so LR da chuan hoa cua B1
+            # Standardized B1 logistic-regression coefficients.
             sc, lr = extras["b1_lr"]
             imp_rows.append(pd.DataFrame({"seed": seed, "feature": ALL_COLS, "lr_coef": lr.coef_[0]}))
 
@@ -748,7 +727,7 @@ def run_combo(args, model, lang, ds="halueval"):
                 if not hs_is_cached(ns_r, args):
                     info = write_resid_v2(Z, keep[tr], keep[te], ns, ns_r)
                     r2_rows.append(dict(seed=seed, **info))
-                    print(f"  [resid] R^2 trung binh tren test: hidden {info['mean_r2_hidden_test']:.3f}, "
+                    print(f"  [resid] Mean test R^2: hidden {info['mean_r2_hidden_test']:.3f}, "
                           f"seq/glob {info['mean_r2_stats_test']:.3f}", flush=True)
                 rh = run_hs(ns_r, cfg, spec, args, yte, gte)
                 preds["hs_final_resid"], preds["hs_deep_resid"] = rh["final"], rh["deep"]
@@ -821,40 +800,40 @@ def write_summary(out: Path, df, overlap, model, lang, args, ds="halueval"):
     agg["o"] = agg["model"].map({n: i for i, n in enumerate(order)}).fillna(99)
     agg = agg.sort_values("o").drop(columns="o")
     agg.to_csv(out / "auroc_summary.csv", index=False)
-    lines += ["## AUROC tren tap test (mean +- std qua seed)\n",
-              "`explained_vs_hs_final` = (AUROC_baseline - 0.5) / (AUROC_hs_final - 0.5): ti le 'phan vuot chance' "
-              "cua mo hinh hidden ma baseline tai hien lai.\n", md_table(agg), ""]
+    lines += ["## Test-set AUROC (mean +- standard deviation across seeds)\n",
+              "`explained_vs_hs_final` = (AUROC_baseline - 0.5) / (AUROC_hs_final - 0.5): fraction of the "
+              "hidden model's above-chance performance recovered by the baseline.\n", md_table(agg), ""]
 
     lb = out / "length_bins.csv"
     if lb.exists():
         d = pd.read_csv(lb)
         d = d[d["bin"].isin(["weighted", "matched"])]
         t = d.groupby(["bin", "model"])["auc"].agg(["mean", "std"]).reset_index()
-        lines += ["## AUROC khi kiem soat do dai (bin theo phan vi do dai token cua answer)\n",
-                  "`matched`: can bang nhan trong tung bin -> do dai khong con phan biet duoc. "
-                  "`weighted`: AUROC trong bin, trung binh co trong so.\n", md_table(t), ""]
+        lines += ["## AUROC controlled for answer length (bins use test-set token-length quantiles)\n",
+                  "`matched`: labels are balanced within each bin, so length is no longer predictive. "
+                  "`weighted`: weighted mean of per-bin AUROC.\n", md_table(t), ""]
     cp = out / "complementarity.csv"
     if cp.exists():
         d = pd.read_csv(cp).groupby(["learner", "comparison"])[["auc_a", "auc_b", "delta", "ci_lo", "ci_hi"]].mean().reset_index()
-        lines += ["## Complementarity (delta AUROC; ci = trung binh khoang 95% bootstrap cua tung seed)\n",
+        lines += ["## Complementarity (AUROC change; CI is the mean per-seed 95% bootstrap interval)\n",
                   md_table(d), ""]
     pt = out / "perturbation.csv"
     if pt.exists():
         d = pd.read_csv(pt)
         base = df[df["name"].isin(d["name"].unique())].assign(perturbation="none")[["seed", "perturbation", "name", "auc"]]
         t = pd.concat([base, d]).groupby(["name", "perturbation"])["auc"].mean().unstack("perturbation")
-        lines += ["## Perturbation tren answer (train va test deu bi bien doi)\n", md_table(t.reset_index()), ""]
+        lines += ["## Answer perturbations (applied to both training and test data)\n", md_table(t.reset_index()), ""]
     ip = out / "importance_b1.csv"
     if ip.exists():
         d = pd.read_csv(ip)
         cols = [c for c in ["perm_auc_drop", "shap_mean_abs"] if c in d]
         t = d.groupby("feature")[cols].mean().sort_values(cols[0], ascending=False).head(12).reset_index()
-        lines += ["## Feature quan trong nhat cua B1-GBM (permutation / SHAP, trung binh qua seed)\n", md_table(t), ""]
+        lines += ["## Most important B1-GBM features (permutation / SHAP, mean across seeds)\n", md_table(t), ""]
     sf = out / "single_feature_auroc.csv"
     if sf.exists():
         t = pd.read_csv(sf).groupby("feature")["auc"].mean()
         t = t.reindex((t - 0.5).abs().sort_values(ascending=False).index).head(10).reset_index()
-        lines += ["## AUROC co dau cua tung feature don le (top 10 lech 0.5 nhat)\n", md_table(t), ""]
+        lines += ["## Signed AUROC for individual features (10 farthest from 0.5)\n", md_table(t), ""]
     lines += ["## Chan doan split\n", md_table(pd.Series(overlap).rename("value").reset_index()
                                              .rename(columns={"index": "stat"})), ""]
     (out / "summary.md").write_text("\n".join(lines), encoding="utf-8")
@@ -882,20 +861,20 @@ def parse_args(argv=None):
     ap.add_argument("--stack_mode", default=None, choices=["logit", "vector"])
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--skip", nargs="*", default=[], choices=SKIPPABLE,
-                    help="Bo qua thanh phan: b2 b3 hs resid complement perturb importance")
+                    help="Skip components: b2 b3 hs resid complement perturb importance")
     ap.add_argument("--hs_cond", default="full", choices=["full", "base"],
-                    help="Cau hinh mo hinh hidden-state = dieu kien RQ1: full (bat het A/B/C) hoac base (tat het)")
-    ap.add_argument("--views", default="last,amean", help="Phai khop --views luc extraction v2 / RQ1")
+                    help="Hidden-state model configuration from RQ1: full (all A/B/C components) or base (none).")
+    ap.add_argument("--views", default="last,amean", help="Must match the views used by v2 extraction / RQ1.")
     ap.add_argument("--quant", default="4bit", choices=["4bit", "8bit", "fp16"])
     ap.add_argument("--stacker", default="full", choices=["full", "lite"])
-    ap.add_argument("--no_reuse", action="store_true", help="Train lai hidden-state model, khong dung OOF/cache cu")
+    ap.add_argument("--no_reuse", action="store_true", help="Retrain the hidden-state model instead of reusing OOF/cache data.")
     ap.add_argument("--keep_tmp", action="store_true", help="Giu feature residualized trong results/features")
     ap.add_argument("--boot", type=int, default=1000, help="So lan bootstrap cho complementarity")
     ap.add_argument("--n_bins", type=int, default=5)
     ap.add_argument("--perturb", nargs="+", default=PERTURBATIONS, choices=PERTURBATIONS)
     ap.add_argument("--hs_perturb", nargs="*", default=[], choices=PERTURBATIONS,
                     help="Trich lai feature + train lai hidden model tren answer da perturb (rat ton thoi gian)")
-    ap.add_argument("--perturb_b3", action="store_true", help="Cho B3 chay ca cac perturbation")
+    ap.add_argument("--perturb_b3", action="store_true", help="Run B3 for the perturbations as well.")
     ap.add_argument("--b3_model", default="xlm-roberta-base")
     ap.add_argument("--b3_epochs", type=int, default=3)
     ap.add_argument("--b3_bs", type=int, default=32)
@@ -911,7 +890,7 @@ def main(argv=None):
     print(f"[rq2] models={args.models} langs={args.langs} seeds={args.seeds} skip={args.skip} "
           f"hs_cond={args.hs_cond} perturb={args.perturb} hs_perturb={args.hs_perturb}", flush=True)
     if args.dry_run:
-        print("[rq2] --dry_run: dung o day, khong chay gi.", flush=True)
+        print("[rq2] --dry_run: stopping without running experiments.", flush=True)
         return 0
     failed = []
     for ds in args.datasets:
