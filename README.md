@@ -2,7 +2,7 @@
 
 White-box hallucination detection for LLMs from their internal states, evaluated on HaluEval QA (English, French, Vietnamese, Bangali) and on a TriviaQA hard-negative set.
 
-![Pipeline](./figures/pipeline.png)
+![Pipeline](./figures/pipeline-EN.png)
 
 ## Overview
 
