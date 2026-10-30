@@ -1,0 +1,69 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+secrets/
+credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Data & Datasets
+data/
+datasets/
+raw_data/
+processed_data/
+results/
+*.csv
+*.parquet
+*.arrow
+*.feather
+*.npy
+*.npz
+*.hdf5
+*.h5
+
+# Logs & Temporary Files
+*.log
+logs/
+tmp/
+temp/
+.cache/
+*.tmp
+*.bak
+*.old
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.zst
