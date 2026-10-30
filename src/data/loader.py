@@ -8,7 +8,7 @@ def load_halueval(lang='en'):
     """
     Loads the HaluEval dataset.
     For 'en', it attempts to load from a local file first, then falls back to HuggingFace.
-    For other languages ('fr', 'bn', 'am'), it requires a local pre-translated JSON file.
+    For other languages ('fr', 'bn', 'vi'), it requires a local pre-translated JSON file.
     """
     local_path = f"data/halueval_{lang}.json"
     if os.path.exists(local_path):
@@ -83,4 +83,3 @@ def load_triviaqa(lang='en', seed=42, max_samples=10000):
         return samples
     else:
         raise FileNotFoundError(f"Translated dataset {local_path} not found. Please provide the translated dataset with Gemma-2-2B negatives.")
-
