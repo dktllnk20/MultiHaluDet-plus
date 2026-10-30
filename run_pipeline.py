@@ -437,7 +437,7 @@ def main():
                         help="One or both supported models (default: mistral-7b).")
     parser.add_argument("--dataset", choices=["halueval", "triviaqa"], default="halueval",
                         help="Dataset to process (default: halueval).")
-    parser.add_argument("--lang", choices=["en", "fr", "bn", "am", "vi"], default="en",
+    parser.add_argument("--lang", choices=["en", "fr", "bn", "vi"], default="en",
                         help="Dataset language (default: en).")
     parser.add_argument("--stage", choices=["extract", "train_oof", "ensemble", "all"], default="all",
                         help="extract includes v2 probes; all runs every stage (default: all).")

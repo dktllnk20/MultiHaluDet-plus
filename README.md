@@ -102,7 +102,7 @@ Use `--limit` to process only the first N records, and `--seed` to change the ra
 |---|---|---|
 | `--v2` | Boolean flag; enables v2 features and probes | off (Base) |
 | `--models` | `mistral-7b`, `llama2-7b` (one or both) | `mistral-7b` |
-| `--lang` | `en`, `fr`, `bn`, `am`, `vi` | `en` |
+| `--lang` | `en`, `fr`, `bn`, `vi` | `en` |
 | `--dataset` | `halueval`, `triviaqa` | `halueval` |
 | `--stage` | `extract`, `train_oof`, `ensemble`, `all` | `all` |
 | `--limit` | Positive record count | No limit |
