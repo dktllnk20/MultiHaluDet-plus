@@ -10,20 +10,20 @@ White-box hallucination detection for LLMs from their internal states, evaluated
    - **Base** (default): per-layer statistics of hidden states from 32 sampled layers (12 statistics x L), plus 30 global features from the output logits.
    - **v2** (`--v2`): keeps the full **hidden-state vectors** (views `last`, `amean`) and uses a **verify prompt** ("Is the proposed answer correct? Answer (Yes or No):"). Global features grow to 46 (30 base + 13 answer log-likelihood / PMI + 3 Yes/No log-probs).
 2. **Layer probes** (v2 only): for every (view, layer), an out-of-fold linear probe `StandardScaler -> PCA(256) -> LogisticRegression(C=0.02)`. Folds are grouped by question. Probes run automatically after extraction when `--v2` is enabled. Their logits are appended to the network input.
-3. **MultiHaluDet** (trained per inner fold): a sequential branch (multi-scale attention, Transformer, attention pooling) and a global branch (MLP), merged by gated fusion. Loss: BCE + Focal + Asymmetric + Contrastive, AdamW + EMA, Mixup/CutMix. v2 additionally uses delta channels, layer-weight scaling and a pairwise AUC rank loss.
+3. **MultiHaluDet** (trained per inner fold): a sequential branch (multi-scale attention, Transformer, attention pooling) and a global branch (MLP), merged by gated fusion. Loss: BCE + Focal + Asymmetric + Contrastive, AdamW + EMA, Mixup/CutMix. v2 can optionally enable delta channels, layer-weight scaling and a pairwise AUC rank loss; all three are off by default.
 4. **Stacking**: out-of-fold outputs of the 5 fold networks feed the base classifiers (RF, HistGB, LR, SVM, XGB, LGBM); a logistic-regression meta-learner combines their log-odds. The final probability is averaged over the 5 test sets.
 
 ### What v2 adds over Base
 
 | | Base | v2 |
 |---|---|---|
-| LLM features | scalar statistics only | scalar statistics + full hidden-state vectors + per-layer probe logits |
-| Prompt | `Question: ... Answer: ...` | verify prompt, Yes/No log-probs, PMI against a question-free prompt |
-| Global features | 30 | 46 (+ 2V probe summaries) |
+| LLM features | 12 scalar statistics per sampled layer | same scalar statistics; hidden-state vectors are extracted to train probes, whose per-layer logits are fed to the detector |
+| Prompt | `Question: ... Answer: ...` | verify prompt by default; adds answer-token likelihood/PMI features and verify-only Yes/No log-probs; plain prompt is also supported |
+| Global features | 30 | 43 with plain prompt or 46 with verify prompt, plus 2 values per probe view when global probes are enabled (default: 50 total with verify and 2 views) |
 | Stages | extract, train_oof, ensemble | extract (includes **probe**), train_oof, ensemble |
-| Network | sequential input of 12 channels | + probe channels, delta channels, layer-weight scaling, pairwise AUC rank loss |
+| Network | 12 sequential channels per layer | probe-logit channels are enabled by default; delta channels, layer-weight scaling and pairwise AUC rank loss are optional (off by default) |
 | Train/test split | by row | **by question** (both answers of a question stay together) |
-| Stacker | 5-fold by row, 6 classifiers, 576-d features | folds by question, logit stacking, optional `lite` stacker |
+| Stacker | 5-fold by row; 576-d vector features and 6 classifiers by default | 5-fold by question; 576-d vector features and 6 classifiers by default; optional OOF-logit input (`--stack_mode logit`) or 2-classifier `lite` stacker |
 | Extra metric | - | **pair accuracy** (wrong answer scored above the correct one) |
 | Optional | - | `--pair_center` (subtract per-question mean) |
 
