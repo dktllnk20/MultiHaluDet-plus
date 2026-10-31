@@ -26,7 +26,7 @@ LOG_ROOT = ROOT / "logs" / "rq1_ablation"
 RES_ROOT = ROOT / "results" / "rq1_ablation"
 
 MODELS = ["mistral-7b", "llama2-7b"]
-LANGS = ["en", "fr", "vi", "bn"]
+LANGS = ["en"]
 DATASETS = ["triviaqa", "halueval"]       # Run TriviaQA first as the primary result.
 SEEDS = [1, 11, 29, 37, 43]
 STAGES = ["extract", "probe", "train_oof", "ensemble"]
@@ -116,11 +116,11 @@ def out_dir(model, lang):
 
 
 def fkey2(ds, lang, model, pm):
-    return f"{ds}_{lang}_{model}_{pm}"
+    return f"{ds}_{model}_{pm}"
 
 
 def okey(ds, lang, model, pm, tag):
-    return f"{ds}_{lang}_{model}_v2{pm}_{tag}"
+    return f"{ds}_{model}_v2{pm}_{tag}"
 
 
 def feat_state(ds, lang, model, pm, views):
@@ -241,7 +241,7 @@ def build_jobs(a, conds, specs):
         for lang in a.langs:
             for ds in a.datasets:
                 data_ok, msg = check_data(ds, lang)
-                base = [sys.executable, "run_pipeline.py", "--dataset", ds, "--lang", lang, "--model", model]
+                base = [sys.executable, "run_pipeline.py", "--dataset", ds, "--models", model]
                 ld = log_dir(model, lang)
                 usable = {}
                 for pm in sorted({specs[c]["pm"] for c in conds}):

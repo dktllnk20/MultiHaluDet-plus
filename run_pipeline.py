@@ -8,6 +8,8 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import hashlib
+import json
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import gc
@@ -34,6 +36,7 @@ from src.settings.runtime import ROOT_DIR, capture_run_log, ensure_directory
 
 
 GLOB_GROUPS = {"base": "base_", "ll": "ans_", "yn": "v_"}
+DATASET_LANGUAGE = "en"
 
 
 def _select_glob(X_glob, names, use):
@@ -55,20 +58,20 @@ def _opt(args, name, default):
 
 
 def _key(args, tag=True):
-    """Build the feature or run output key, including the selected feature version and record limit."""
-    base = f"{args.dataset}_{args.lang}_{args.model}"
+    """Build a language-neutral feature or run key with an optional feature-version tag."""
+    base = f"{args.dataset}_{args.model}"
     if _opt(args, "limit", None) is not None:
         base += f"_limit{args.limit}"
     feat = "v2" if _opt(args, "v2", False) else _opt(args, "feat", "v1")
-    if tag and feat == "v2":
-        base += f"_v2{_opt(args, 'prompt_mode', 'verify')}"
+    if tag:
+        base += "_v2" if feat == "v2" else "_base"
     tag_value = _opt(args, "tag", "")
     return f"{base}_{tag_value}" if tag and tag_value else base
 
 
 def _fkey2(args):
     limit = f"_limit{args.limit}" if _opt(args, "limit", None) is not None else ""
-    return f"{args.dataset}_{args.lang}_{args.model}{limit}_{_opt(args, 'prompt_mode', 'verify')}"
+    return f"{args.dataset}_{args.model}{limit}_{_opt(args, 'prompt_mode', 'verify')}"
 
 
 def _feat_dir2(args):
@@ -84,11 +87,109 @@ def _probe_path(args, config):
 
 def _load_samples(args, config):
     if args.dataset == "halueval":
-        samples = load_halueval(lang=args.lang)
+        samples = load_halueval(lang=DATASET_LANGUAGE)
     else:
-        samples = load_triviaqa(lang=args.lang, seed=config.seed)
+        samples = load_triviaqa(lang=DATASET_LANGUAGE, seed=config.seed)
     limit = _opt(args, "limit", None)
     return samples[:limit] if limit is not None else samples
+
+
+def _extract_state_path(args):
+    if _opt(args, "v2", False):
+        return ROOT_DIR / _feat_dir2(args) / ".extract_state.json"
+    key = _key(args, tag=False)
+    return ROOT_DIR / "results" / "features" / f".extract_state_{key}.json"
+
+
+def _extract_signature(args, config, samples):
+    sample_data = json.dumps(samples, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    signature = {
+        "dataset": args.dataset,
+        "model": args.model,
+        "model_name": MODEL_REGISTRY[args.model],
+        "limit": _opt(args, "limit", None),
+        "seed": config.seed,
+        "feature_version": "v2" if _opt(args, "v2", False) else "base",
+        "quant": _opt(args, "quant", "4bit"),
+        "extract_batch_size": _opt(args, "extract_batch_size", 4),
+        "samples_sha256": hashlib.sha256(sample_data.encode("utf-8")).hexdigest(),
+    }
+    if _opt(args, "v2", False):
+        signature["prompt_mode"] = _opt(args, "prompt_mode", "verify")
+        signature["views"] = [v.strip() for v in _opt(args, "views", "last,amean").split(",") if v.strip()]
+    return signature
+
+
+def _extract_outputs_complete(args, samples, allow_partial=False):
+    count = len(samples)
+    labels = np.asarray([sample["is_hallucination"] for sample in samples])
+    if not _opt(args, "v2", False):
+        key = _key(args, tag=False)
+        paths = [ROOT_DIR / "results" / "features" / f"{name}_{key}.npy"
+                 for name in ("X_seq", "X_glob", "y")]
+        if not all(path.is_file() for path in paths):
+            return False
+        try:
+            seq, glob, saved_labels = (np.load(path, mmap_mode="r") for path in paths)
+        except (OSError, ValueError, EOFError):
+            return False
+        rows = seq.shape[0] if seq.ndim == 3 else -1
+        return (seq.ndim == 3 and glob.ndim == 2 and glob.shape[0] == rows
+                and saved_labels.shape == (rows,)
+                and (allow_partial or (rows == count and np.array_equal(saved_labels, labels))))
+
+    out_dir = ROOT_DIR / _feat_dir2(args)
+    required = [out_dir / name for name in ("meta.json", "progress.json", "seq.npy", "glob.npy",
+                                              "valid.npy", "y.npy", "groups.npy")]
+    views = [v.strip() for v in _opt(args, "views", "last,amean").split(",") if v.strip()]
+    required.extend(out_dir / f"H_{view}.npy" for view in views)
+    if not all(path.is_file() for path in required):
+        return False
+    try:
+        meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+        progress = json.loads((out_dir / "progress.json").read_text(encoding="utf-8"))
+        seq = np.load(out_dir / "seq.npy", mmap_mode="r")
+        glob = np.load(out_dir / "glob.npy", mmap_mode="r")
+        valid = np.load(out_dir / "valid.npy", mmap_mode="r")
+        saved_labels = np.load(out_dir / "y.npy", mmap_mode="r")
+        groups = np.load(out_dir / "groups.npy", mmap_mode="r")
+        hidden_shapes = [np.load(out_dir / f"H_{view}.npy", mmap_mode="r").shape for view in views]
+    except (OSError, ValueError, EOFError, KeyError, TypeError):
+        return False
+    expected_groups = make_groups(samples)
+    return (meta.get("N") == count and meta.get("mode") == _opt(args, "prompt_mode", "verify")
+            and meta.get("views") == views and progress.get("next") == count
+            and seq.ndim == 3 and seq.shape[0] == count and glob.ndim == 2 and glob.shape[0] == count
+            and valid.shape == (count,) and saved_labels.shape == (count,)
+            and groups.shape == (count,) and np.array_equal(saved_labels, labels)
+            and np.array_equal(groups, expected_groups)
+            and all(len(shape) == 3 and shape[0] == meta.get("L")
+                    and shape[1] == count and shape[2] == meta.get("D") for shape in hidden_shapes))
+
+
+def _save_extract_state(path, signature):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps(signature, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary_path, path)
+
+
+def _extraction_is_resumable(args, config, samples):
+    state_path = _extract_state_path(args)
+    signature = _extract_signature(args, config, samples)
+    if state_path.is_file():
+        try:
+            saved_signature = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return (saved_signature == signature
+                and _extract_outputs_complete(args, samples, allow_partial=True))
+
+    if _extract_outputs_complete(args, samples):
+        _save_extract_state(state_path, signature)
+        print(f"[resume] Verified existing Stage 1 outputs and saved resume state: {state_path.relative_to(ROOT_DIR)}")
+        return True
+    return False
 
 
 def _load_llm(args, config):
@@ -115,16 +216,17 @@ def _load_llm(args, config):
     return tokenizer, model_llm
 
 
-def stage_1_extract(args, config):
+def stage_1_extract(args, config, samples=None):
     print("\n--- Stage 1: feature extraction ---")
-    print(f"Dataset: {args.dataset} ({args.lang}), Model: {args.model}")
+    print(f"Dataset: {args.dataset}, Model: {args.model}")
 
-    samples = _load_samples(args, config)
+    if samples is None:
+        samples = _load_samples(args, config)
     tokenizer, model_llm = _load_llm(args, config)
 
     key = _key(args, tag=False)
     ensure_directory("results/features")
-    ckpt_path = f'results/features/partial_{key}.npz'
+    ckpt_path = f'results/features/partial_{key}_s{config.seed}.npz'
     X_seq, X_glob, y = extract_dataset(samples, tokenizer, model_llm, config, ckpt_path,
                                        batch_size=args.extract_batch_size)
     X_seq = np.nan_to_num(X_seq, nan=0.0)
@@ -142,10 +244,11 @@ def stage_1_extract(args, config):
     print("Stage 1 completed. Features saved.")
 
 
-def stage_1_extract_v2(args, config):
+def stage_1_extract_v2(args, config, samples=None):
     print(f"\n--- Stage 1 (v2): feature extraction, prompt={_opt(args, 'prompt_mode', 'verify')} ---")
-    print(f"Dataset: {args.dataset} ({args.lang}), Model: {args.model}")
-    samples = _load_samples(args, config)
+    print(f"Dataset: {args.dataset}, Model: {args.model}")
+    if samples is None:
+        samples = _load_samples(args, config)
     tokenizer, model_llm = _load_llm(args, config)
     views = tuple(v.strip() for v in args.views.split(",") if v.strip())
     out_dir = _feat_dir2(args)
@@ -417,7 +520,17 @@ def run_model(args):
     torch.manual_seed(config.seed)
 
     if args.stage in ("extract", "all"):
-        (stage_1_extract_v2 if args.v2 else stage_1_extract)(args, config)
+        samples = _load_samples(args, config)
+        if _extraction_is_resumable(args, config, samples):
+            print("[resume] Stage 1 extraction already completed for matching inputs; skipping feature extraction.")
+        else:
+            state_path = _extract_state_path(args)
+            if state_path.exists():
+                state_path.unlink()
+            print("[resume] No matching complete Stage 1 outputs; starting feature extraction.")
+            (stage_1_extract_v2 if args.v2 else stage_1_extract)(args, config, samples)
+            _save_extract_state(state_path, _extract_signature(args, config, samples))
+            print(f"[resume] Stage 1 completion saved: {state_path.relative_to(ROOT_DIR)}")
         if args.v2:
             stage_2_probe(args, config)
     if args.stage in ("train_oof", "all"):
@@ -437,8 +550,6 @@ def main():
                         help="One or both supported models (default: mistral-7b).")
     parser.add_argument("--dataset", choices=["halueval", "triviaqa"], default="halueval",
                         help="Dataset to process (default: halueval).")
-    parser.add_argument("--lang", choices=["en", "fr", "bn", "vi"], default="en",
-                        help="Dataset language (default: en).")
     parser.add_argument("--stage", choices=["extract", "train_oof", "ensemble", "all"], default="all",
                         help="extract includes v2 probes; all runs every stage (default: all).")
     parser.add_argument("--limit", type=int, help="Process at most this many dataset records (positive integer).")
@@ -451,14 +562,14 @@ def main():
     os.chdir(ROOT_DIR)
     for model in args.models:
         args.model = model
-        family = "mistral" if model.startswith("mistral") else "llama"
+        model_family = "mistral" if model.startswith("mistral") else "llama"
         variant = "v2" if args.v2 else "base"
-        log_path = ROOT_DIR / "logs" / family / (
-            f"{args.dataset}_{args.lang}_{variant}_s{args.seed}.log"
+        log_path = ROOT_DIR / "logs" / model_family / (
+            f"{args.dataset}_{variant}_{args.stage}_s{args.seed}.log"
         )
         with capture_run_log(log_path):
             print(f"Model: {model}")
-            print(f"Dataset: {args.dataset} | language: {args.lang} | features: {variant}")
+            print(f"Dataset: {args.dataset} | features: {variant}")
             limit_text = args.limit if args.limit is not None else "all"
             print(f"Stage: {args.stage} | seed: {args.seed} | limit: {limit_text}")
             run_model(args)

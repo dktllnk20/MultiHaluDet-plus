@@ -3,6 +3,7 @@ run_pipeline.py uses these helpers to manage output folders and capture run logs
 Feature and result files remain in their existing project-level output directories.
 """
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 import sys
 import traceback
@@ -100,10 +101,18 @@ class _Tee:
 
 @contextmanager
 def capture_run_log(path):
-    """Write plain UTF-8 logs and display highlighted output without terminal warnings."""
+    """Append a timestamped run section and display highlighted output without terminal warnings."""
     log_path = ensure_parent(path)
     terminal_out, terminal_err = sys.stdout, sys.stderr
-    with log_path.open("w", encoding="utf-8") as log:
+    has_previous_run = log_path.exists() and log_path.stat().st_size > 0
+    with log_path.open("a", encoding="utf-8") as log:
+        if has_previous_run:
+            log.write("\n")
+        separator = "-" * 28
+        log.write(f"{separator}\n")
+        log.write(f"Run started: {datetime.now().strftime('%d-%m-%Y (%H:%M:%S)')}\n")
+        log.write(f"{separator}\n")
+        log.flush()
         rich_out = _RichTerminal(terminal_out)
         with redirect_stdout(_Tee(rich_out, log)), redirect_stderr(_Tee(terminal_err, log)):
             original_showwarning = warnings.showwarning
