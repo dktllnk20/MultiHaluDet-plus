@@ -1,8 +1,8 @@
-# MultiHaluDet plus
+# Hidden-State Probes, Answer Likelihood, and Surface Shortcuts in White-Box Hallucination Detection
 
-White-box hallucination detection for LLMs from their internal states, evaluated on HaluEval QA (English, French, Vietnamese, Bangali) and on a TriviaQA hard-negative set.
+White-box hallucination detection for LLMs from their internal states, evaluated on English HaluEval QA and a TriviaQA hard-negative set.
 
-![Pipeline](./figures/pipeline-EN.png)
+![Pipeline](./figures/pipeline.png)
 
 ## Overview
 
@@ -30,14 +30,9 @@ White-box hallucination detection for LLMs from their internal states, evaluated
 ## Setup
 
 ```bash
-git clone https://github.com/Danglee1107/MultiHaluDet-exhance.git && cd MultiHaluDet-exhance
+git clone https://github.com/dktllnk20/MultiHaluDet-plus.git && cd MultiHaluDet-plus
 ```
 then
-
-```bash
-uv sync
-```
-or
 
 ```bash
 pip install -r requirements.txt
@@ -49,70 +44,82 @@ Gated models (e.g. Llama-2) need a Hugging Face token. Put it in a `.env` file a
 echo "HF_TOKEN=hf_xxxxxxxx" > .env
 ```
 
+
+Data notes:
+- HaluEval uses English data from `data/halueval.json`, falling back to HuggingFace if the file is missing.
+- TriviaQA expects `data/triviaqa.json` with exactly two rows per question (one correct answer = label 0, one hard negative = label 1). Without it, it falls back to a TriviaQA version with random wrong answers.
+
+> [!NOTE]
+> For TriviaQA, the dataset was edited and relabeled from lucadiliello/triviaqa on Hugging Face. If you would like to reproduce our experiments, please contact us using the Gmail address below.
+
+Hardware: All experiments were conducted on a system equipped with an AMD Ryzen 7 7435HS CPU and an NVIDIA GeForce RTX 4050 GPU with 6 GB of VRAM.
+
+## Run
+
+### Pipeline
+```bash
+# all pipeline
+python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42
+
+# stage by stage
+python run_pipeline.py --models mistral-7b --dataset halueval --stage extract
+python run_pipeline.py --models mistral-7b --dataset halueval --stage train_oof
+python run_pipeline.py --models mistral-7b --dataset halueval --stage ensemble
+
+```
+
+### Research question
+```bash
+python run_pipeline.py --rq 1
+python run_pipeline.py --rq 2
+```
+
+### supported models
+- mistral-7b
+- llama2-7b
+
+## Results summary
+
+| Dataset          | Model      | Base AUROC | V2 AUROC  | Δ AUROC   |
+| ---------------- | ---------- | ---------- | --------- | --------- |
+|  HaluEval | Mistral-7B | 0.9849     | **0.9931** | +0.0082 |
+|  HaluEval | Llama-2-7B | 0.9846     | **0.9917** | +0.0071 |
+|  TriviaQA | Mistral-7B | 0.6452     | **0.8226** | +0.1774 |
+|  TriviaQA | Llama-2-7B | 0.5931     | **0.7650** | +0.1719 |
+
+
 ## Structure
 
 ```
 .
-├── run_pipeline.py
-├── run_all.sh                 # Base + v2, several seeds, resumable
-├── figures/pipeline.svg
-├── data/                      # English HaluEval and TriviaQA JSON files
-├── src/
-│   ├── config.py
-│   ├── data/        loader.py, feature_extractor.py (Base), probe_extractor.py (v2), splits.py
-│   ├── probe/       layer_probe.py
-│   ├── models/      multihaludet.py, losses.py
-│   ├── training/    trainer.py, augmentations.py
-│   ├── ensemble/    meta_learner.py
-│   └── utils/       metrics.py, visualization.py
-└── results/                   # created automatically
-    ├── features/              # Base LLM features
-    ├── features_v2/           # v2 hidden-state vectors and scalar features
-    ├── probe/                 # v2 probe logits (.npz) and per-layer AUC report (_auc.txt)
-    ├── oof/                   # out-of-fold outputs
-    └── plots/
+├──  data
+│   ├──  halueval.json
+│   └──  triviaqa.json
+├──  docs
+│   └──  paper.pdf
+├──  figures
+│   └──  pipeline-EN.png
+├──  LICENSE
+├── 󰂺 README.md
+├──  requirements.txt
+├──  run_pipeline.py
+└── 󰣞 src/
+    ├──  __init__.py
+    ├──  config.py
+    ├──  data/
+    ├──  ensemble/
+    ├──  models/
+    ├──  probe/
+    ├──  rq/
+    ├──  settings/
+    ├──  training/
+    └──  utils/
 ```
 
-Data notes:
-- HaluEval uses English data from `data/halueval_en.json`, falling back to HuggingFace if the file is missing.
-- TriviaQA expects `data/triviaqa_en.json` with exactly two rows per question (one correct answer = label 0, one hard negative = label 1). Without it, it falls back to a TriviaQA version with random wrong answers.
+## contact
 
-Hardware: a CUDA GPU is expected (the 4-bit LLM takes ~4 GB, so a 6 GB GPU is enough). Each v2 view takes about 2.6 GB of disk per run for a 32-layer, 4096-d model.
+Have questions about this project, want to reproduce our experiments, or just want to know more? Feel free to reach out! We'd be happy to hear from you.
 
-## Run
+- **Email:** dktlln.k20@gmail.com
 
-```bash
-python run_pipeline.py --v2 --models mistral-7b --dataset halueval --stage extract
-```
-
-`--stage extract` performs feature extraction and, with `--v2`, layer probing. `train_oof` trains the detector, `ensemble` evaluates saved OOF outputs, and `all` runs every stage. The pipeline uses the original English HaluEval and TriviaQA datasets; the default feature set is Base and the default seed is 42.
-
-Stage 1 checks for complete feature outputs matching the dataset, model, record limit, seed, and feature version before loading the LLM. Matching outputs are reused; otherwise extraction runs and saves a completion record under `results/`. With v2, the probe stage still runs after feature reuse and reuses its own cached probe when available. Resume-by-stage applies to extraction only; training and ensemble stages run when requested.
-
-Run both supported models:
-
-```bash
-python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa --stage all
-```
-
-Use `--limit` to process only the first N records, and `--seed` to change the random seed. Logs are written under `logs/mistral/` or `logs/llama/` as `<dataset>_<base|v2>_<stage>_s<seed>.log`, regardless of the exact model name. Each run appends to its log, separated by a timestamp in `day-month-year (time)` format.
-
-### Supported options
-
-| Flag | Values | Default |
-|---|---|---|
-| `--v2` | Boolean flag; enables v2 features and probes | off (Base) |
-| `--models` | `mistral-7b`, `llama2-7b` (one or both) | `mistral-7b` |
-| `--dataset` | `halueval`, `triviaqa` | `halueval` |
-| `--stage` | `extract`, `train_oof`, `ensemble`, `all` | `all` |
-| `--limit` | Positive record count | No limit |
-| `--seed` | integer | 42 |
-
-### Outputs
-
-`results/features/` or `results/features_v2/` (LLM features) and `results/probe/` (probe logits and a per-layer AUC table) use language-neutral names. OOF files and plots omit the language and identify the feature version: base uses `_base`, while v2 uses `_v2`. AUC, F1 and accuracy are printed to the terminal; pair accuracy is printed too when the split is by question.
-
-## Notes
-
-- The seed controls the dataset split, inner folds, and (for v2) probe folds.
-- Base uses a row-level split, while v2 splits by question; results are not directly comparable.
+Whether it's a question, feedback, or a collaboration idea, don't hesitate to drop us an email. We're always happy to connect!
