@@ -52,7 +52,7 @@ Data notes:
 > [!NOTE]
 > For TriviaQA, the dataset was edited and relabeled from lucadiliello/triviaqa on Hugging Face. If you would like to reproduce our experiments, please contact us using the Gmail address below.
 
-Hardware: All experiments were conducted on a system equipped with an AMD Ryzen 7 7435HS CPU and an NVIDIA GeForce RTX 4050 GPU with 6 GB of VRAM.
+Hardware: All experiments were conducted on a system equipped with an **AMD Ryzen 7 7435HS CPU** and an **NVIDIA GeForce RTX 4050 GPU** with 6 GB of VRAM.
 
 ## Run
 
