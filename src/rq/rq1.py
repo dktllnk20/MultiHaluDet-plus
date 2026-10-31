@@ -1,5 +1,5 @@
-"""Runs the RQ1 component-ablation experiments and summarizes paired results.
-This research workflow uses run_pipeline.py stages and stores logs and CSV reports.
+"""Runs the RQ1 ablation and probe-only experiments and summarizes their results.
+This research workflow uses the feature pipeline stages and stores logs and CSV reports.
 Invoke this module directly to execute or collect the RQ1 experiment grid.
 """
 import argparse
@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import stats
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -22,12 +24,15 @@ sys.path.insert(0, str(ROOT))
 FEAT2_DIR = ROOT / "results" / "features_v2"
 OOF_DIR = ROOT / "results" / "oof"
 PROBE_DIR = ROOT / "results" / "probe"
-LOG_ROOT = ROOT / "logs" / "rq1_ablation"
-RES_ROOT = ROOT / "results" / "rq1_ablation"
+RQ1_ROOT = ROOT / "results" / "rq1"
+LOG_ROOT = RQ1_ROOT / "rq1_ablation" / "job_logs"
+RES_ROOT = RQ1_ROOT / "rq1_ablation"
+BASE_LOG_ROOT = LOG_ROOT
+BASE_RES_ROOT = RES_ROOT
 
 MODELS = ["mistral-7b", "llama2-7b"]
-LANGS = ["en"]
-DATASETS = ["triviaqa", "halueval"]       # Run TriviaQA first as the primary result.
+LANG = "en"
+DATASETS = ["triviaqa"]
 SEEDS = [1, 11, 29, 37, 43]
 STAGES = ["extract", "probe", "train_oof", "ensemble"]
 
@@ -36,6 +41,20 @@ COMPONENTS = ["A_prompt", "A_ll", "A_yn", "B_seq", "B_glob", "C_delta", "C_scale
 GROUPS = {"A": COMPONENTS[0:3], "B": COMPONENTS[3:5], "C": COMPONENTS[5:9]}
 N_BASE, N_LL, N_YN = 30, 13, 3     # Global feature counts: base_*, ans_*, v_*.
 RANK_WEIGHT = 0.1
+ACTIVE_LIMIT = None
+
+
+def _limit_suffix():
+    return f"_limit{ACTIVE_LIMIT}" if ACTIVE_LIMIT is not None else ""
+
+
+def _set_active_limit(limit):
+    global ACTIVE_LIMIT, LOG_ROOT, PROBE_ONLY_DIR, RES_ROOT
+    ACTIVE_LIMIT = limit
+    suffix = _limit_suffix()
+    LOG_ROOT = BASE_LOG_ROOT.with_name(BASE_LOG_ROOT.name + suffix)
+    RES_ROOT = BASE_RES_ROOT.with_name(BASE_RES_ROOT.name + suffix)
+    PROBE_ONLY_DIR = RES_ROOT.parent / f"probe_only{suffix}"
 
 
 def _norm(comps):
@@ -83,8 +102,137 @@ GROUP_PAIRS, FINE_PAIRS = build_pairs()
 ALL_PAIRS = {**GROUP_PAIRS, **FINE_PAIRS}
 
 
+# ------------------------------------------------------------------ probe-only analysis
+PROBE_ONLY_DIR = RQ1_ROOT / "probe_only"
+
+
+def _probe_auc(y, scores):
+    return float(roc_auc_score(y, scores)) if len(np.unique(y)) > 1 and np.std(scores) > 0 else float("nan")
+
+
+def probe_only_one_run(ds, lang, model, pm, views, seed):
+    from src.config import get_config
+    from src.data.probe_extractor import load_v2
+    from src.data.splits import outer_split, pair_accuracy, rows_to_keep
+
+    path = probe_path(ds, lang, model, pm, views, seed)
+    if not path.exists():
+        print(f"[skipped] missing {path.name}")
+        return None
+
+    cfg = get_config()
+    features = load_v2(str(FEAT2_DIR / fkey2(ds, lang, model, pm)))
+    keep = rows_to_keep(features["valid"], features["groups"], False)
+    y, groups = features["y"][keep], features["groups"][keep]
+    train, test = outer_split(y, groups, cfg.test_size, seed, True)
+    with np.load(path) as saved:
+        probes = saved["probe"]
+        probe_views = [str(view) for view in saved["views"]]
+    if probes.shape[0] != len(y) or probe_views != views:
+        print(f"[skipped] {path.name}: shape {probes.shape} / views {probe_views} do not match "
+              f"the feature data ({len(y)} rows, {views})")
+        return None
+
+    _, layer_count, view_count = probes.shape
+    y_train, y_test, groups_test = y[train], y[test], groups[test]
+    mean, std = probes[train].mean(0), probes[train].std(0) + 1e-6
+    normalized = (probes - mean) / std
+    oof_auc = np.array([[_probe_auc(y_train, probes[train, layer, view])
+                         for view in range(view_count)] for layer in range(layer_count)])
+    test_auc = np.array([[_probe_auc(y_test, probes[test, layer, view])
+                          for view in range(view_count)] for layer in range(layer_count)])
+    layer_rows = [
+        dict(dataset=ds, model=model, prompt=pm, seed=seed, view=views[view],
+             layer=layer + 1, oof_auc=oof_auc[layer, view], test_auc=test_auc[layer, view])
+        for layer in range(layer_count) for view in range(view_count)
+    ]
+
+    scores = {}
+    best_layer = np.nanargmax(oof_auc, axis=0)
+    for view in range(view_count):
+        scores[f"best_layer_{views[view]}"] = (
+            normalized[test, best_layer[view], view], f"layer {best_layer[view] + 1}")
+    best_index = np.unravel_index(np.nanargmax(oof_auc), oof_auc.shape)
+    scores["best_cell"] = (normalized[test, best_index[0], best_index[1]],
+                           f"layer {best_index[0] + 1} view {views[best_index[1]]}")
+    scores["mean_best_views"] = (
+        np.mean([normalized[test, best_layer[view], view] for view in range(view_count)], axis=0),
+        ",".join(f"{views[view]}:{best_layer[view] + 1}" for view in range(view_count)))
+    ranked = np.argsort(-np.nan_to_num(oof_auc, nan=-1).ravel())[:5]
+    top_cells = [np.unravel_index(index, oof_auc.shape) for index in ranked]
+    scores["mean_top5"] = (
+        np.mean([normalized[test, layer, view] for layer, view in top_cells], axis=0),
+        ",".join(f"{layer + 1}{views[view][0]}" for layer, view in top_cells))
+    scores["mean_all"] = (normalized[test].reshape(len(test), -1).mean(1),
+                          f"{layer_count}x{view_count} cells")
+    flat = normalized.reshape(len(y), -1)
+    classifier = LogisticRegression(C=0.05, max_iter=2000).fit(flat[train], y_train)
+    scores["lr_all"] = (classifier.decision_function(flat[test]), "C=0.05")
+
+    rows = [
+        dict(dataset=ds, model=model, prompt=pm, seed=seed, method=name,
+             auc=_probe_auc(y_test, values), pair_acc=pair_accuracy(values, y_test, groups_test)[0],
+             n_test=len(test), selected=selection)
+        for name, (values, selection) in scores.items()
+    ]
+    return rows, layer_rows
+
+
+def run_probe_only(argv=None):
+    parser = argparse.ArgumentParser(description="RQ1 probe-only analysis of cached v2 probe logits.",
+                                     allow_abbrev=False)
+    parser.add_argument("--models", nargs="+", default=MODELS, choices=MODELS)
+    parser.add_argument("--datasets", nargs="+", default=["triviaqa"], choices=DATASETS)
+    parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    parser.add_argument("--limit", type=int, help="Limit dataset records for small test runs.")
+    parser.add_argument("--prompt_modes", nargs="+", default=["verify", "plain"],
+                        choices=["verify", "plain"])
+    parser.add_argument("--views", default="last,amean")
+    args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be a positive integer.")
+    _set_active_limit(args.limit)
+    views = [view.strip() for view in args.views.split(",") if view.strip()]
+    rows, layer_rows = [], []
+    for dataset in args.datasets:
+        for model in args.models:
+            for prompt_mode in args.prompt_modes:
+                for seed in args.seeds:
+                    result = probe_only_one_run(dataset, LANG, model, prompt_mode, views, seed)
+                    if result:
+                        rows.extend(result[0])
+                        layer_rows.extend(result[1])
+    if not rows:
+        raise SystemExit("No probe files could be read.")
+
+    PROBE_ONLY_DIR.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows)
+    frame.to_csv(PROBE_ONLY_DIR / "per_seed.csv", index=False)
+    pd.DataFrame(layer_rows).to_csv(PROBE_ONLY_DIR / "layer_auc.csv", index=False)
+    grouping = ["dataset", "model", "prompt", "method"]
+    summary = frame.groupby(grouping).agg(
+        auc_mean=("auc", "mean"), auc_std=("auc", "std"), pair_acc=("pair_acc", "mean"),
+        n_seeds=("seed", "nunique")).reset_index()
+    summary.to_csv(PROBE_ONLY_DIR / "summary.csv", index=False)
+
+    pd.set_option("display.width", 200, "display.max_columns", 20,
+                  "display.float_format", "{:.4f}".format)
+    print("\n=== Probe-only (test AUROC, mean/std across seeds) ===")
+    print(summary.to_string(index=False))
+    runs_path = RES_ROOT / "all_runs.csv"
+    if runs_path.exists():
+        runs = pd.read_csv(runs_path)
+        runs = runs[runs["cond"].isin(["base", "full", "add_B", "loo_B"])
+                    & runs["dataset"].isin(args.datasets)]
+        comparison = runs.groupby(["dataset", "model", "cond"])[
+            ["deep_test_auc", "ens_auc"]].mean().reset_index()
+        print("\n=== RQ1 deep/ensemble AUROC (for comparison with probe-only results) ===")
+        print(comparison.to_string(index=False))
+    print(f"\nSaved to {PROBE_ONLY_DIR}")
+
+
 def cond_spec(comps, a):
-    """Build run_pipeline.py flags and the training signature for one condition."""
+    """Build pipeline flags and the training signature for one condition."""
     views = [v.strip() for v in a.views.split(",") if v.strip()]
     pm = "verify" if "A_prompt" in comps else "plain"
     glob = ["base"] + [g for g, k in (("ll", "A_ll"), ("yn", "A_yn")) if k in comps]
@@ -108,19 +256,26 @@ def cond_spec(comps, a):
 
 # ------------------------------------------------------------------ paths
 def log_dir(model, lang):
-    return LOG_ROOT / model / lang
+    return LOG_ROOT / model
 
 
 def out_dir(model, lang):
-    return RES_ROOT / model / lang
+    return RES_ROOT / model
 
 
 def fkey2(ds, lang, model, pm):
-    return f"{ds}_{model}_{pm}"
+    return f"{ds}_{model}{_limit_suffix()}_{pm}"
 
 
 def okey(ds, lang, model, pm, tag):
-    return f"{ds}_{model}_v2{pm}_{tag}"
+    return f"{ds}_{model}{_limit_suffix()}_v2_{tag}"
+
+
+def oof_complete(key):
+    required = ("X_train_deep", "X_test_deep", "oof_logits", "test_logits",
+                "X_glob_train", "X_glob_test", "y_train", "y_test",
+                "g_train", "g_test")
+    return all((OOF_DIR / f"{name}_{key}.npy").is_file() for name in required)
 
 
 def feat_state(ds, lang, model, pm, views):
@@ -154,19 +309,6 @@ def alias_oof(src_key, dst_key):
 
 
 # ------------------------------------------------------------------ shared utilities
-class Tee:
-    def __init__(self, *files):
-        self.files = files
-
-    def write(self, s):
-        for f in self.files:
-            f.write(s)
-
-    def flush(self):
-        for f in self.files:
-            f.flush()
-
-
 def run_logged(cmd, log_path, mode):
     """Run a command from ROOT, mirror output to the console and log, and return its status."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,13 +324,13 @@ def run_logged(cmd, log_path, mode):
         return proc.wait()
 
 
-def merge_write(path, new, models, langs, datasets):
-    """Merge all_*.csv while replacing rows for the model/language/dataset just processed."""
+def merge_write(path, new, models, datasets):
+    """Merge all_*.csv while replacing rows for the model/dataset just processed."""
     merged = new
     if path.exists():
         old = pd.read_csv(path)
-        if {"model", "lang", "dataset"} <= set(old.columns):
-            drop = old["model"].isin(models) & old["lang"].isin(langs) & old["dataset"].isin(datasets)
+        if {"model", "dataset"} <= set(old.columns):
+            drop = old["model"].isin(models) & old["dataset"].isin(datasets)
             old = old[~drop]
             merged = pd.concat([old, new], ignore_index=True) if len(old) else new
     if len(merged) or path.exists():
@@ -200,10 +342,10 @@ _DATA_CACHE = {}
 
 
 def check_data(ds, lang):
-    """Check a dataset file and report label statistics once per dataset/language pair."""
+    """Check a dataset file and report label statistics once per dataset."""
     if (ds, lang) in _DATA_CACHE:
         return _DATA_CACHE[(ds, lang)]
-    path = ROOT / "data" / f"{ds}_{lang}.json"
+    path = ROOT / "data" / f"{ds}.json"
     rel = path.relative_to(ROOT)
     if not path.exists():
         if ds == "halueval" and lang == "en":
@@ -228,7 +370,7 @@ def check_data(ds, lang):
                 res = (True, msg)
         except Exception as e:
             res = (False, f"Could not read {rel}: {type(e).__name__}: {e}")
-    print(f"[data] {ds}/{lang}: {res[1]}")
+    print(f"[data] {ds}: {res[1]}")
     _DATA_CACHE[(ds, lang)] = res
     return res
 
@@ -238,10 +380,12 @@ def build_jobs(a, conds, specs):
     views = [v.strip() for v in a.views.split(",") if v.strip()]
     jobs, skipped = [], []
     for model in a.models:
-        for lang in a.langs:
+        for lang in [LANG]:
             for ds in a.datasets:
                 data_ok, msg = check_data(ds, lang)
                 base = [sys.executable, "run_pipeline.py", "--dataset", ds, "--models", model]
+                if a.limit is not None:
+                    base += ["--limit", str(a.limit)]
                 ld = log_dir(model, lang)
                 usable = {}
                 for pm in sorted({specs[c]["pm"] for c in conds}):
@@ -291,7 +435,7 @@ def build_jobs(a, conds, specs):
                                 deps.append(f"probe|{model}|{lang}|{ds}|{pm}|{seed}")
                             jobs.append({"id": train_id, "kind": "train", "model": model, "lang": lang, "ds": ds,
                                          "seed": seed, "pm": pm, "deps": deps, "src_key": src_key,
-                                         "pending": a.force or not (OOF_DIR / f"y_test_{src_key}.npy").exists(),
+                                         "pending": a.force or not oof_complete(src_key),
                                          "cmd": base + ["--stage", "train_oof", "--seed", str(seed),
                                                         "--tag", train_tag] + sp["train"],
                                          "log": ld / f"rq1_{ds}_{train_tag}.log", "mode": "w"})
@@ -313,7 +457,7 @@ def build_jobs(a, conds, specs):
 
 def finished_ok(j):
     if j["kind"] == "train":
-        return (OOF_DIR / f"y_test_{j['src_key']}.npy").exists()
+        return oof_complete(j["src_key"])
     if j["kind"] == "ensemble":
         return "Results Summary" in j["log"].read_text(encoding="utf-8", errors="replace")
     return True
@@ -324,8 +468,7 @@ def step_run(a):
     specs = {c: cond_spec(comps, a) for c, comps in conds.items()}
     if not a.dry_run:
         LOG_ROOT.mkdir(parents=True, exist_ok=True)
-        sys.stdout = Tee(sys.__stdout__, open(LOG_ROOT / "master.log", "a", encoding="utf-8"))
-        print(f"\n######## {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(sys.argv)}")
+        print(f"\n######## RQ1 started {time.strftime('%d-%m-%Y (%H:%M:%S)')}")
 
     print("\n--- Conditions ---")
     for c, sp in specs.items():
@@ -335,17 +478,17 @@ def step_run(a):
     jobs, skipped = build_jobs(a, conds, specs)
 
     print("\n--- Plan (pending / total) ---")
-    combos = sorted({(j["model"], j["lang"], j["ds"]) for j in jobs})
-    for model, lang, ds in combos:
+    combos = sorted({(j["model"], j["ds"]) for j in jobs})
+    for model, ds in combos:
         cells = []
         for kind in ("extract", "probe", "train", "ensemble"):
-            sel = [j for j in jobs if (j["model"], j["lang"], j["ds"]) == (model, lang, ds) and j["kind"] == kind]
+            sel = [j for j in jobs if (j["model"], j["ds"]) == (model, ds) and j["kind"] == kind]
             cells.append(f"{kind}: {sum(j['pending'] for j in sel)}/{len(sel)}")
-        print(f"  {model:11s} {lang} {ds:9s} " + "  ".join(cells))
+        print(f"  {model:11s} {ds:9s} " + "  ".join(cells))
     print(f"Total: {len(combos)} combinations | " + " | ".join(
         f"{k} {sum(j['pending'] for j in jobs if j['kind'] == k)}" for k in ("extract", "probe", "train", "ensemble")))
     for model, lang, ds, pm, why in skipped:
-        print(f"  [skipped] {model} {lang} {ds} ({pm}): {why}")
+        print(f"  [skipped] {model} {ds} ({pm}): {why}")
     if a.dry_run:
         return
 
@@ -353,7 +496,7 @@ def step_run(a):
     for j in jobs:
         if not j["pending"]:
             continue
-        label = f"{j['kind']} | {j['model']} {j['lang']} {j['ds']} | " + str(j.get("cond") or j.get("pm"))
+        label = f"{j['kind']} | {j['model']} {j['ds']} | " + str(j.get("cond") or j.get("pm"))
         if j.get("seed") is not None:
             label += f" s{j['seed']}"
         if any(d in failed for d in j["deps"]):
@@ -378,14 +521,13 @@ def step_run(a):
     for msg in failures:
         print(msg)
     for model, lang, ds, pm, why in skipped:
-        print(f"[skipped] {model} {lang} {ds} ({pm}): {why}")
-    print("Collect results with the rq1.py --step collect command.")
+        print(f"[skipped] {model} {ds} ({pm}): {why}")
 
 
 # ------------------------------------------------------------------ collect stage
 RESULT = re.compile(r"^AUC: ([\d.]+), F1: ([\d.]+), Acc: ([\d.]+)", re.M)
 PAIRACC = re.compile(r"^Pair accuracy \(.*?\): ([\d.]+)", re.M)
-GROUP_KEYS = ["model", "lang", "dataset"]
+GROUP_KEYS = ["model", "dataset"]
 METRICS = ["deep_test_auc", "deep_oof_auc", "ens_auc", "ens_f1", "ens_acc", "ens_pair_acc", "deep_pair_acc"]
 PAIRED_METRICS = ["ens_auc", "deep_test_auc", "ens_pair_acc"]
 
@@ -397,7 +539,7 @@ def collect_one(model, lang, ds, cond, seed, spec):
     from sklearn.metrics import roc_auc_score
     from src.data.splits import pair_accuracy
     text = lp.read_text(encoding="utf-8", errors="replace")
-    row = {"model": model, "lang": lang, "dataset": ds, "cond": cond, "seed": seed, "log": lp.name}
+    row = {"model": model, "dataset": ds, "cond": cond, "seed": seed, "log": lp.name}
     m = RESULT.findall(text)
     if m:
         row["ens_auc"], row["ens_f1"], row["ens_acc"] = map(float, m[-1])
@@ -473,38 +615,38 @@ def step_collect(a):
     pairs = ALL_PAIRS if a.level == "fine" else GROUP_PAIRS
     rows = []
     for model in a.models:
-        for lang in a.langs:
-            for ds in a.datasets:
-                for cond in conds:
-                    for seed in a.seeds:
-                        r = collect_one(model, lang, ds, cond, seed, specs[cond])
-                        if r:
-                            rows.append(r)
+        for ds in a.datasets:
+            for cond in conds:
+                for seed in a.seeds:
+                    r = collect_one(model, LANG, ds, cond, seed, specs[cond])
+                    if r:
+                        rows.append(r)
     if not rows:
-        sys.exit("No rq1_<dataset>_<condition>_s<seed>.log files were found.")
+        print("No completed RQ1 runs are available to collect.")
+        return
     runs = pd.DataFrame(rows)
     for _, r in runs[runs["config_problem"] != ""].iterrows():
-        print(f"[warning] {r['model']}/{r['lang']}/{r['log']}: {r['config_problem']}")
+        print(f"[warning] {r['model']}/{r['log']}: {r['config_problem']}")
     for _, r in runs[~runs["complete"]].iterrows():
-        print(f"[incomplete] {r['model']}/{r['lang']}/{r['log']}")
+        print(f"[incomplete] {r['model']}/{r['log']}")
 
     RES_ROOT.mkdir(parents=True, exist_ok=True)
-    runs_all = merge_write(RES_ROOT / "all_runs.csv", runs, a.models, a.langs, a.datasets)
+    runs_all = merge_write(RES_ROOT / "all_runs.csv", runs, a.models, a.datasets)
     ok = runs[runs["complete"] & (runs["config_problem"] == "")]
     if ok.empty:
-        sys.exit("No valid runs are available to summarize.")
+        print("No valid RQ1 runs are available to summarize.")
+        return
     summary, per_seed, paired = analyze(ok, pairs)
-    summary = merge_write(RES_ROOT / "all_summary.csv", summary, a.models, a.langs, a.datasets)
-    per_seed = merge_write(RES_ROOT / "all_paired_per_seed.csv", per_seed, a.models, a.langs, a.datasets)
-    paired = merge_write(RES_ROOT / "all_paired_summary.csv", paired, a.models, a.langs, a.datasets)
+    summary = merge_write(RES_ROOT / "all_summary.csv", summary, a.models, a.datasets)
+    per_seed = merge_write(RES_ROOT / "all_paired_per_seed.csv", per_seed, a.models, a.datasets)
+    paired = merge_write(RES_ROOT / "all_paired_summary.csv", paired, a.models, a.datasets)
     for model in a.models:
-        for lang in a.langs:
-            d = out_dir(model, lang)
-            for df, name in ((runs_all, "runs.csv"), (summary, "summary.csv"),
-                             (per_seed, "paired_per_seed.csv"), (paired, "paired_summary.csv")):
-                if len(df) and ((df["model"] == model) & (df["lang"] == lang)).any():
-                    d.mkdir(parents=True, exist_ok=True)
-                    df[(df["model"] == model) & (df["lang"] == lang)].drop(columns=["model", "lang"]).to_csv(d / name, index=False)
+        d = out_dir(model, LANG)
+        for df, name in ((runs_all, "runs.csv"), (summary, "summary.csv"),
+                         (per_seed, "paired_per_seed.csv"), (paired, "paired_summary.csv")):
+            if len(df) and (df["model"] == model).any():
+                d.mkdir(parents=True, exist_ok=True)
+                df[df["model"] == model].drop(columns=["model"]).to_csv(d / name, index=False)
 
     pd.set_option("display.width", 220, "display.max_columns", 30, "display.max_rows", 300,
                   "display.float_format", "{:.4f}".format)
@@ -528,21 +670,25 @@ def step_collect(a):
             combos=("delta_mean", "size"), seeds_better=("n_with_better", "sum"), seeds=("n_seeds", "sum"))
         t = t.join(e).reindex([x for x in order if x in t.index])
         t["better"] = t["seeds_better"].astype(int).astype(str) + "/" + t["seeds"].astype(int).astype(str)
-        print(f"\n=== {ds}: delta = with - without, averaged over {int(t['combos'].max())} model/language combinations ===")
+        print(f"\n=== {ds}: delta = with - without, averaged over {int(t['combos'].max())} model combinations ===")
         print(t[["d_ens", "d_ens_min", "d_ens_max", "d_deep", "d_pairacc", "better"]].to_string())
     print("\nNote: with five seeds, the minimum Wilcoxon p-value is 0.0625; consider the direction, "
           "number of positive seeds, and effect size.")
 
 
 # ------------------------------------------------------------------ main
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if "--probe-only" in argv:
+        argv.remove("--probe-only")
+        return run_probe_only(argv)
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                 allow_abbrev=False)
     p.add_argument("--step", default="run", choices=["run", "collect", "diagnostics"])
     p.add_argument("--models", nargs="+", default=MODELS, choices=MODELS)
-    p.add_argument("--langs", nargs="+", default=LANGS, choices=LANGS)
-    p.add_argument("--datasets", nargs="+", default=DATASETS, choices=DATASETS)
+    p.add_argument("--datasets", nargs="+", default=DATASETS, choices=["triviaqa"])
     p.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    p.add_argument("--limit", type=int, help="Limit dataset records for small test runs.")
     p.add_argument("--level", default="group", choices=["group", "fine"],
                    help="group: base/full/loo_A,B,C/add_A,B,C; fine: include individual components")
     p.add_argument("--conditions", nargs="+", default=None, choices=list(ALL_CONDS),
@@ -556,10 +702,20 @@ def main():
     p.add_argument("--force_extract", action="store_true", help="Re-extract features and probes.")
     p.add_argument("--keep_going", action="store_true", help="Record failed stages and continue.")
     p.add_argument("--dry_run", action="store_true", help="Print the execution plan without running it.")
-    a = p.parse_args()
+    a = p.parse_args(argv)
+    if a.limit is not None and a.limit < 1:
+        p.error("--limit must be a positive integer.")
+    _set_active_limit(a.limit)
     if a.step == "diagnostics":
         sys.exit("RQ1 has no diagnostics step; choose run or collect.")
-    (step_run if a.step == "run" else step_collect)(a)
+    if a.step == "run":
+        step_run(a)
+        if not a.dry_run and "ensemble" in a.stages:
+            print("\n--- Automatically collecting RQ1 results ---")
+            step_collect(a)
+    else:
+        step_collect(a)
+    return 0
 
 
 if __name__ == "__main__":

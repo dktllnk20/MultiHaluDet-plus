@@ -1,6 +1,6 @@
 """Runs RQ2 experiments on answer-surface shortcuts and hidden-state detector features.
 The workflow compares text baselines with cached pipeline features and reports CSV summaries.
-It imports run_pipeline.py stages for the hidden-state experiments.
+It imports the feature pipeline stages for the hidden-state experiments.
 """
 from __future__ import annotations
 
@@ -39,6 +39,9 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
 
 RESULTS = ROOT / "results" / "rq2"
+BASE_RESULTS = RESULTS
+MODELS = ["mistral-7b", "llama2-7b"]
+DATASETS = ["halueval", "triviaqa"]
 DEFAULT_SEEDS = [1, 11, 29, 37, 43]
 PERTURBATIONS = ["lowercase", "no_punct", "shuffle_words", "cut_first3", "keep_first3"]
 SKIPPABLE = ["b2", "b3", "hs", "resid", "complement", "perturb", "importance"]
@@ -215,21 +218,44 @@ def lr_scores(Ztr, ytr, Zte, seed, extra_tr=None, extra_te=None):
 
 
 def tfidf_scores(q_tr, a_tr, y_tr, q_te, a_te, mode, analyzer, seed):
-    def vec():
+    def vec(min_df=2):
         if analyzer == "word":
-            return TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True,
+            return TfidfVectorizer(ngram_range=(1, 2), min_df=min_df, sublinear_tf=True,
                                    token_pattern=r"(?u)\b\w+\b", max_features=300000)
         # Preserve case so stylistic capitalization remains measurable.
-        return TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=2, sublinear_tf=True,
+        return TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=min_df, sublinear_tf=True,
                                lowercase=False, max_features=300000)
+
+    def fit_vectorizer(tr, te):
+        vectorizer = vec()
+        try:
+            train_features = vectorizer.fit_transform(tr)
+        except ValueError as exc:
+            if "no terms remain" not in str(exc).lower() and "empty vocabulary" not in str(exc).lower():
+                raise
+            vectorizer = vec(min_df=1)
+            try:
+                train_features = vectorizer.fit_transform(tr)
+            except ValueError as fallback_exc:
+                if "no terms remain" not in str(fallback_exc).lower() and \
+                        "empty vocabulary" not in str(fallback_exc).lower():
+                    raise
+                return None
+        return vectorizer, train_features, vectorizer.transform(te)
+
     srcs = {"answer": [("a", a_tr, a_te)], "question": [("q", q_tr, q_te)],
             "both": [("q", q_tr, q_te), ("a", a_tr, a_te)]}[mode]
     btr, bte, names = [], [], []
     for pre, tr, te in srcs:
-        v = vec()
-        btr.append(v.fit_transform(tr))
-        bte.append(v.transform(te))
+        fitted = fit_vectorizer(tr, te)
+        if fitted is None:
+            continue
+        v, Xtr, Xte = fitted
+        btr.append(Xtr)
+        bte.append(Xte)
         names += [f"{pre}:{n}" for n in v.get_feature_names_out()]
+    if not btr:
+        return np.zeros(len(q_te)), None, []
     Xtr, Xte = sparse.hstack(btr).tocsr(), sparse.hstack(bte).tocsr()
     clf = LogisticRegressionCV(Cs=[0.1, 0.3, 1, 3, 10], cv=3, scoring="roc_auc", solver="liblinear",
                                max_iter=1000, random_state=seed)
@@ -276,7 +302,7 @@ def baseline_scores(Z, Q, A, tr, te, y, seed, full, want_b2=True):
             s, clf, names = tfidf_scores(list(Q[tr]), list(A[tr]), ytr, list(Q[te]), list(A[te]),
                                          mode, an, seed)
             preds[f"b2_{mode}_{an}"] = s
-            if full and mode == "answer":
+            if full and mode == "answer" and clf is not None:
                 extras[f"top_{an}"] = top_ngrams(clf, names)
     return preds, extras
 
@@ -407,7 +433,7 @@ def hs_ns(dataset_key, lang, model, seed, spec, args):
         feat="v2", prompt_mode=spec["pm"], views=args.views, quant=args.quant,
         probe_use=spec["probe"], glob_use=",".join(spec["glob"]), pair_center=False, group_split=True,
         redo_probe=False, stacker=args.stacker, stack_mode=args.stack_mode or spec["stack"],
-        extract_batch_size=args.extract_batch_size, seed=seed)
+        extract_batch_size=args.extract_batch_size, seed=seed, limit=args.limit)
 
 
 def feat_dir(ns) -> Path:
@@ -578,12 +604,14 @@ def length_analysis(y, length, preds, n_bins, seed, n_rep=20) -> pd.DataFrame:
             k = min(len(pos), len(neg))
             if k:
                 keep += list(rng.choice(pos, k, replace=False)) + list(rng.choice(neg, k, replace=False))
-        keep = np.asarray(keep)
+        keep = np.asarray(keep, dtype=int)
         for m, s in preds.items():
-            matched[m].append(fast_auc(y[keep], s[keep]))
+            matched[m].append(fast_auc(y[keep], s[keep]) if len(keep) else float("nan"))
     for m in preds:
+        scores = np.asarray(matched[m], dtype=float)
+        scores = scores[np.isfinite(scores)]
         rows.append(dict(seed=seed, bin="matched", lo=np.nan, hi=np.nan, n=len(keep), pos_rate=0.5,
-                         model=m, auc=float(np.nanmean(matched[m]))))
+                         model=m, auc=float(scores.mean()) if len(scores) else np.nan))
     return pd.DataFrame(rows)
 
 
@@ -633,21 +661,24 @@ def write_pair_length_stats(out: Path, y, groups, tok, words):
 
 
 # ----------------------------------------------------------------------------------------------
-# One (model, language) combination
+# One model/dataset combination
 # ----------------------------------------------------------------------------------------------
 def run_combo(args, model, lang, ds="halueval"):
     from src.data.loader import load_halueval, load_triviaqa
     from src.data.splits import make_groups, pair_accuracy
 
-    out = RESULTS / f"{ds}_{lang}_{model}"
+    limit_suffix = f"_limit{args.limit}" if args.limit is not None else ""
+    out = RESULTS / f"{ds}_{model}{limit_suffix}"
     out.mkdir(parents=True, exist_ok=True)
     t_combo = time.perf_counter()
     # TriviaQA has two rows per question; its loader samples only above max_samples.
     samples = load_halueval(lang=lang) if ds == "halueval" else load_triviaqa(lang=lang, seed=42)
+    if args.limit is not None:
+        samples = samples[:args.limit]
     Q = [s["question"] for s in samples]
     A = [s["answer"] for s in samples]
     y = np.array([int(s["is_hallucination"]) for s in samples])
-    print(f"\n{'=' * 90}\nRQ2 | {ds} | {lang} | {model} | N={len(y)} pos={y.mean():.3f}\n{'=' * 90}",
+    print(f"\n{'=' * 90}\nRQ2 | {ds} | {model} | N={len(y)} pos={y.mean():.3f}\n{'=' * 90}",
           flush=True)
 
     use_hs = "hs" not in args.skip
@@ -765,7 +796,6 @@ def run_combo(args, model, lang, ds="halueval"):
     # ---------------- aggregate ----------------
     df = pd.DataFrame(rows)
     df.insert(0, "model", model)
-    df.insert(0, "lang", lang)
     df.insert(0, "dataset", ds)
     df.to_csv(out / "per_seed_auroc.csv", index=False)
     pd.concat(bin_rows).to_csv(out / "length_bins.csv", index=False)
@@ -778,17 +808,17 @@ def run_combo(args, model, lang, ds="halueval"):
         pd.DataFrame(pert_rows).to_csv(out / "perturbation.csv", index=False)
     if r2_rows:
         pd.DataFrame(r2_rows).to_csv(out / "resid_r2.csv", index=False)
-    write_summary(out, df, overlap, model, lang, args, ds)
-    print(f"\n[done] {model}/{lang} trong {time.perf_counter() - t_combo:.0f}s -> {out}", flush=True)
+    write_summary(out, df, overlap, model, args, ds)
+    print(f"\n[done] {model} {ds} trong {time.perf_counter() - t_combo:.0f}s -> {out}", flush=True)
     return True
 
 
-def write_summary(out: Path, df, overlap, model, lang, args, ds="halueval"):
+def write_summary(out: Path, df, overlap, model, args, ds="halueval"):
     pv = df.pivot(index="seed", columns="name", values="auc")
     agg = pd.DataFrame({"mean": pv.mean(), "std": pv.std(ddof=1), "n": pv.count()})
     if "pair_acc" in df:
         agg["pair_acc_mean"] = df.pivot(index="seed", columns="name", values="pair_acc").mean()
-    lines = [f"# RQ2 | {ds} | {lang} | {model} | seeds {list(pv.index)}\n"]
+    lines = [f"# RQ2 | {ds} | {model} | seeds {list(pv.index)}\n"]
     if "hs_final" in pv:
         frac = pv.sub(0.5).div(pv["hs_final"] - 0.5, axis=0)
         agg["explained_vs_hs_final"] = frac.mean()
@@ -844,7 +874,7 @@ def build_summary_all():
     if not parts:
         return
     d = pd.concat(parts)
-    s = d.groupby(["dataset", "lang", "model", "name"])["auc"].agg(["mean", "std", "count"]).reset_index()
+    s = d.groupby(["dataset", "model", "name"])["auc"].agg(["mean", "std", "count"]).reset_index()
     s.to_csv(RESULTS / "summary_all.csv", index=False)
     print(f"[summary] {RESULTS / 'summary_all.csv'}", flush=True)
 
@@ -853,10 +883,10 @@ def build_summary_all():
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="RQ2: surface-feature baselines vs hidden-state detector (HaluEval)",
                                  allow_abbrev=False)
-    ap.add_argument("--models", nargs="+", default=["mistral-7b"])
-    ap.add_argument("--langs", nargs="+", default=["en"])
-    ap.add_argument("--datasets", nargs="+", default=["halueval"], choices=["halueval", "triviaqa"])
+    ap.add_argument("--models", nargs="+", default=MODELS, choices=MODELS)
+    ap.add_argument("--datasets", nargs="+", default=DATASETS, choices=DATASETS)
     ap.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
+    ap.add_argument("--limit", type=int, help="Limit dataset records for small test runs.")
     ap.add_argument("--extract_batch_size", type=int, default=4)
     ap.add_argument("--stack_mode", default=None, choices=["logit", "vector"])
     ap.add_argument("--dry_run", action="store_true")
@@ -885,9 +915,14 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    global RESULTS
     args = parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        raise SystemExit("--limit must be a positive integer.")
+    suffix = f"_limit{args.limit}" if args.limit is not None else ""
+    RESULTS = BASE_RESULTS.with_name(BASE_RESULTS.name + suffix)
     RESULTS.mkdir(parents=True, exist_ok=True)
-    print(f"[rq2] models={args.models} langs={args.langs} seeds={args.seeds} skip={args.skip} "
+    print(f"[rq2] models={args.models} seeds={args.seeds} skip={args.skip} "
           f"hs_cond={args.hs_cond} perturb={args.perturb} hs_perturb={args.hs_perturb}", flush=True)
     if args.dry_run:
         print("[rq2] --dry_run: stopping without running experiments.", flush=True)
@@ -895,14 +930,13 @@ def main(argv=None):
     failed = []
     for ds in args.datasets:
         for model in args.models:
-            for lang in args.langs:
-                try:
-                    if not run_combo(args, model, lang, ds):
-                        failed.append((ds, model, lang))
-                except Exception:  # noqa: BLE001
-                    traceback.print_exc()
-                    failed.append((ds, model, lang))
-                    sys.stdout.flush()
+            try:
+                if not run_combo(args, model, "en", ds):
+                    failed.append((ds, model))
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                failed.append((ds, model))
+                sys.stdout.flush()
     build_summary_all()
     if failed:
         print(f"[rq2] LOI o: {failed}", flush=True)

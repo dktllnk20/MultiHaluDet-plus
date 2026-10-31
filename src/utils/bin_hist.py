@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA = ROOT / "data" / "halueval_en.json"
+DEFAULT_DATA = ROOT / "data" / "halueval.json"
 DEFAULT_OUT_DIR = ROOT / "results" / "img"
 
 # (correct_key, hallucinated_key) candidates for the paired layout
@@ -420,7 +420,7 @@ def plot_period_hist(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", default=str(DEFAULT_DATA), help="path to halueval_en.json")
+    p.add_argument("--data", default=str(DEFAULT_DATA), help="path to halueval.json")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     p.add_argument("--fig", choices=["a", "b", "both"], default="both",
                    help="a = length-bin histogram, b = ends-with-period Yes/No, both = default")

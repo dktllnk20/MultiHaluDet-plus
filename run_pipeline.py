@@ -14,6 +14,12 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import gc
 import random
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import torch
@@ -505,16 +511,13 @@ def stage_4_ensemble(args, config):
 
 
 def run_model(args):
-    args.views = "last,amean"
-    args.prompt_mode = "verify"
-    args.probe_use = "both"
-    args.glob_use = "base,ll,yn"
-    args.pair_center = False
-    args.stack_mode = "vector"
-    args.extract_batch_size = 4
+    args.v2 = args.v2 or args.feat == "v2"
 
     config = get_config()
     config.seed = args.seed
+    config.use_layer_delta = args.layer_delta
+    config.scale_layer_weights = args.layer_scale
+    config.rank_loss_weight = args.rank_weight
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -537,24 +540,81 @@ def run_model(args):
         stage_2_3_train_oof(args, config)
     if args.stage in ("ensemble", "all"):
         stage_4_ensemble(args, config)
+    if args.stage == "probe":
+        if not args.v2:
+            raise SystemExit("The probe stage requires --feat v2 or --v2.")
+        stage_2_probe(args, config)
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if any(arg == "--rq" or arg.startswith("--rq=") for arg in argv):
+        rq_parser = argparse.ArgumentParser(
+            add_help=False,
+            description="Run one research workflow. Other flags are ignored when --rq is used.",
+            allow_abbrev=False,
+        )
+        rq_parser.add_argument("--rq", required=True, choices=["1", "2"])
+        rq_parser.add_argument("--limit", type=int,
+                               help="Limit dataset records for small RQ test runs.")
+        rq_parser.add_argument("--models", nargs="+", choices=PIPELINE_MODELS,
+                               help="Select models for the RQ workflow.")
+        rq_args, ignored = rq_parser.parse_known_args(argv)
+        if rq_args.limit is not None and rq_args.limit < 1:
+            rq_parser.error("--limit must be a positive integer.")
+        if ignored:
+            print(f"[dispatch] Ignoring flags in RQ mode: {' '.join(ignored)}", flush=True)
+        if rq_args.rq == "1":
+            from src.rq.rq1 import main as run_rq
+        else:
+            from src.rq.rq2 import main as run_rq
+        rq_argv = []
+        if rq_args.limit is not None:
+            rq_argv += ["--limit", str(rq_args.limit)]
+        if rq_args.models:
+            rq_argv += ["--models", *rq_args.models]
+        rq_name = f"rq{rq_args.rq}"
+        rq_log = ROOT_DIR / "logs" / rq_name / f"{rq_name}.log"
+        with capture_run_log(rq_log):
+            print(f"Running {rq_name.upper()} workflow.")
+            if rq_args.limit is not None:
+                print(f"Dataset record limit: {rq_args.limit}")
+            if rq_args.models:
+                print(f"Models: {', '.join(rq_args.models)}")
+            result = run_rq(rq_argv)
+        return result if isinstance(result, int) else 0
+
     parser = argparse.ArgumentParser(
         description="Extract features, train the detector, and evaluate its ensemble.",
         allow_abbrev=False,
     )
     parser.add_argument("--v2", action="store_true",
                         help="Use v2 hidden-state features and probes (default: Base features).")
+    parser.add_argument("--feat", choices=["v1", "v2"], default="v1",
+                        help="Feature version, accepted as an alias for --v2 by RQ workflows.")
     parser.add_argument("--models", nargs="+", choices=PIPELINE_MODELS, default=["mistral-7b"],
                         help="One or both supported models (default: mistral-7b).")
     parser.add_argument("--dataset", choices=["halueval", "triviaqa"], default="halueval",
                         help="Dataset to process (default: halueval).")
-    parser.add_argument("--stage", choices=["extract", "train_oof", "ensemble", "all"], default="all",
+    parser.add_argument("--stage", choices=["extract", "probe", "train_oof", "ensemble", "all"], default="all",
                         help="extract includes v2 probes; all runs every stage (default: all).")
     parser.add_argument("--limit", type=int, help="Process at most this many dataset records (positive integer).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
-    args = parser.parse_args()
+    parser.add_argument("--views", default="last,amean")
+    parser.add_argument("--prompt_mode", choices=["verify", "plain"], default="verify")
+    parser.add_argument("--probe_use", choices=["both", "seq", "glob", "none"], default="both")
+    parser.add_argument("--glob_use", default="base,ll,yn")
+    parser.add_argument("--quant", choices=["4bit", "8bit", "fp16"], default="4bit")
+    parser.add_argument("--extract_batch_size", type=int, default=4)
+    parser.add_argument("--stack_mode", choices=["vector", "logit"], default="vector")
+    parser.add_argument("--stacker", choices=["full", "lite"], default="full")
+    parser.add_argument("--redo_probe", action="store_true")
+    parser.add_argument("--pair_center", action="store_true")
+    parser.add_argument("--tag", default="")
+    parser.add_argument("--layer_delta", action="store_true")
+    parser.add_argument("--layer_scale", action="store_true")
+    parser.add_argument("--rank_weight", type=float, default=0.0)
+    args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be a positive integer.")
