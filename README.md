@@ -6,13 +6,12 @@ White-box hallucination detection for LLMs from their internal states, evaluated
 
 ## Overview
 
-1. **Translation**: HaluEval is translated into other languages with `translategemma-12b-it` (`data/halueval_{lang}.json`).
-2. **Feature extraction** (frozen LLM, 4-bit NF4 by default). Two feature sets are available:
+1. **Feature extraction** (frozen LLM, 4-bit NF4 by default). Two feature sets are available:
    - **Base** (default): per-layer statistics of hidden states from 32 sampled layers (12 statistics x L), plus 30 global features from the output logits.
    - **v2** (`--v2`): keeps the full **hidden-state vectors** (views `last`, `amean`) and uses a **verify prompt** ("Is the proposed answer correct? Answer (Yes or No):"). Global features grow to 46 (30 base + 13 answer log-likelihood / PMI + 3 Yes/No log-probs).
-3. **Layer probes** (v2 only): for every (view, layer), an out-of-fold linear probe `StandardScaler -> PCA(256) -> LogisticRegression(C=0.02)`. Folds are grouped by question. Probes run automatically after extraction when `--v2` is enabled. Their logits are appended to the network input.
-4. **MultiHaluDet** (trained per inner fold): a sequential branch (multi-scale attention, Transformer, attention pooling) and a global branch (MLP), merged by gated fusion. Loss: BCE + Focal + Asymmetric + Contrastive, AdamW + EMA, Mixup/CutMix. v2 additionally uses delta channels, layer-weight scaling and a pairwise AUC rank loss.
-5. **Stacking**: out-of-fold outputs of the 5 fold networks feed the base classifiers (RF, HistGB, LR, SVM, XGB, LGBM); a logistic-regression meta-learner combines their log-odds. The final probability is averaged over the 5 test sets.
+2. **Layer probes** (v2 only): for every (view, layer), an out-of-fold linear probe `StandardScaler -> PCA(256) -> LogisticRegression(C=0.02)`. Folds are grouped by question. Probes run automatically after extraction when `--v2` is enabled. Their logits are appended to the network input.
+3. **MultiHaluDet** (trained per inner fold): a sequential branch (multi-scale attention, Transformer, attention pooling) and a global branch (MLP), merged by gated fusion. Loss: BCE + Focal + Asymmetric + Contrastive, AdamW + EMA, Mixup/CutMix. v2 additionally uses delta channels, layer-weight scaling and a pairwise AUC rank loss.
+4. **Stacking**: out-of-fold outputs of the 5 fold networks feed the base classifiers (RF, HistGB, LR, SVM, XGB, LGBM); a logistic-regression meta-learner combines their log-odds. The final probability is averaged over the 5 test sets.
 
 ### What v2 adds over Base
 
