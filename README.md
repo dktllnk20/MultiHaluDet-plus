@@ -56,7 +56,7 @@ echo "HF_TOKEN=hf_xxxxxxxx" > .env
 ├── run_pipeline.py
 ├── run_all.sh                 # Base + v2, several seeds, resumable
 ├── figures/pipeline.svg
-├── data/                      # halueval_{en,fr,bn,vi}.json, triviaqa_{lang}.json
+├── data/                      # English HaluEval and TriviaQA JSON files
 ├── src/
 │   ├── config.py
 │   ├── data/        loader.py, feature_extractor.py (Base), probe_extractor.py (v2), splits.py
@@ -74,26 +74,28 @@ echo "HF_TOKEN=hf_xxxxxxxx" > .env
 ```
 
 Data notes:
-- `en` HaluEval falls back to HuggingFace if `data/halueval_en.json` is missing; other languages need a local translated file.
-- TriviaQA expects `data/triviaqa_{lang}.json` with exactly two rows per question (one correct answer = label 0, one hard negative = label 1). Without it, `en` falls back to a TriviaQA version with random wrong answers.
+- HaluEval uses English data from `data/halueval_en.json`, falling back to HuggingFace if the file is missing.
+- TriviaQA expects `data/triviaqa_en.json` with exactly two rows per question (one correct answer = label 0, one hard negative = label 1). Without it, it falls back to a TriviaQA version with random wrong answers.
 
 Hardware: a CUDA GPU is expected (the 4-bit LLM takes ~4 GB, so a 6 GB GPU is enough). Each v2 view takes about 2.6 GB of disk per run for a 32-layer, 4096-d model.
 
 ## Run
 
 ```bash
-python run_pipeline.py --v2 --models mistral-7b --dataset halueval --lang en --stage extract
+python run_pipeline.py --v2 --models mistral-7b --dataset halueval --stage extract
 ```
 
-`--stage extract` performs feature extraction and, with `--v2`, layer probing. `train_oof` trains the detector, `ensemble` evaluates saved OOF outputs, and `all` runs every stage. The default feature set is Base, the default language is English, and the default seed is 42.
+`--stage extract` performs feature extraction and, with `--v2`, layer probing. `train_oof` trains the detector, `ensemble` evaluates saved OOF outputs, and `all` runs every stage. The pipeline uses the original English HaluEval and TriviaQA datasets; the default feature set is Base and the default seed is 42.
+
+Stage 1 checks for complete feature outputs matching the dataset, model, record limit, seed, and feature version before loading the LLM. Matching outputs are reused; otherwise extraction runs and saves a completion record under `results/`. With v2, the probe stage still runs after feature reuse and reuses its own cached probe when available. Resume-by-stage applies to extraction only; training and ensemble stages run when requested.
 
 Run both supported models:
 
 ```bash
-python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa --lang en --stage all
+python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa --stage all
 ```
 
-Use `--limit` to process only the first N records, and `--seed` to change the random seed. Logs are written to `logs/mistral/` or `logs/llama/` as `<dataset>_<language>_<base|v2>_s<seed>.log`.
+Use `--limit` to process only the first N records, and `--seed` to change the random seed. Logs are written under `logs/mistral/` or `logs/llama/` as `<dataset>_<base|v2>_<stage>_s<seed>.log`, regardless of the exact model name. Each run appends to its log, separated by a timestamp in `day-month-year (time)` format.
 
 ### Supported options
 
@@ -101,7 +103,6 @@ Use `--limit` to process only the first N records, and `--seed` to change the ra
 |---|---|---|
 | `--v2` | Boolean flag; enables v2 features and probes | off (Base) |
 | `--models` | `mistral-7b`, `llama2-7b` (one or both) | `mistral-7b` |
-| `--lang` | `en`, `fr`, `bn`, `vi` | `en` |
 | `--dataset` | `halueval`, `triviaqa` | `halueval` |
 | `--stage` | `extract`, `train_oof`, `ensemble`, `all` | `all` |
 | `--limit` | Positive record count | No limit |
@@ -109,10 +110,9 @@ Use `--limit` to process only the first N records, and `--seed` to change the ra
 
 ### Outputs
 
-`results/features/` or `results/features_v2/` (LLM features), `results/probe/` (probe logits and a per-layer AUC table), `results/oof/` (out-of-fold outputs), `results/plots/results_*.png` (ROC, PR, calibration, confusion matrix, ...). AUC, F1 and accuracy are printed to the terminal; pair accuracy is printed too when the split is by question.
+`results/features/` or `results/features_v2/` (LLM features) and `results/probe/` (probe logits and a per-layer AUC table) use language-neutral names. OOF files and plots omit the language and identify the feature version: base uses `_base`, while v2 uses `_v2`. AUC, F1 and accuracy are printed to the terminal; pair accuracy is printed too when the split is by question.
 
 ## Notes
 
 - The seed controls the dataset split, inner folds, and (for v2) probe folds.
-- Bangla (`bn`) and Vietnamese (`vi`) require a local translated file `data/halueval_{lang}.json`.
 - Base uses a row-level split, while v2 splits by question; results are not directly comparable.
