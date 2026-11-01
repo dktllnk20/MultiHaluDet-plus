@@ -157,15 +157,39 @@ python run_pipeline.py --rq 2
 ## Folder Structure
 
 ```text
-src/
+src.
+├── config.py
 ├── data/
+│   ├── feature_extractor.py
+│   ├── loader.py
+│   ├── probe_extractor.py
+│   └── splits.py
+│
 ├── ensemble/
+│   └── meta_learner.py
+│
 ├── models/
+│   ├── losses.py
+│   └── multihaludet.py
+│
 ├── probe/
+│   └── layer_probe.py
+│
 ├── rq/
+│   ├── rq1.py
+│   └── rq2.py
+│
 ├── settings/
+│   └── runtime.py
+│
 ├── training/
+│   ├── augmentations.py
+│   └── trainer.py
+│
 └── utils/
+    ├── bin_hist.py
+    ├── metrics.py
+    └── visualization.py
 ```
 
 ## Contact
