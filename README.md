@@ -59,7 +59,7 @@ Data notes:
 - TriviaQA expects `data/triviaqa.json` with exactly two rows per question (one correct answer = label 0, one hard negative = label 1). Without it, it falls back to a TriviaQA version with random wrong answers.
 
 > [!NOTE]
-> For TriviaQA, the dataset was edited and relabeled from lucadiliello/triviaqa on Hugging Face. See [Dataset Information](docs/DATASET.md) for more. 
+> For TriviaQA, the dataset was edited and relabeled from lucadiliello/triviaqa on Hugging Face. See [Dataset Information](DATASET.md) for more. 
 
 Hardware: All experiments were conducted on a system equipped with an **AMD Ryzen 7 7435HS CPU** and an **NVIDIA GeForce RTX 4050 GPU** with 6 GB of VRAM.
 
