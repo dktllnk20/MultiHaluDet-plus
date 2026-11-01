@@ -415,7 +415,7 @@ def build_jobs(a, conds, specs):
                                          "model": model, "lang": lang, "ds": ds, "pm": pm, "seed": seed,
                                          "deps": [f"ext|{model}|{lang}|{ds}|{pm}"],
                                          "pending": a.force_extract or not pp.exists(),
-                                         "cmd": base + ["--stage", "probe", "--seed", str(seed), "--feat", "v2",
+                                         "cmd": base + ["--stage", "extract", "--seed", str(seed), "--feat", "v2",
                                                         "--prompt_mode", pm, "--views", ",".join(views)]
                                                 + (["--redo_probe"] if a.force_extract else []),
                                          "log": ld / f"rq1_probe_{ds}_{pm}_s{seed}.log", "mode": "w"})

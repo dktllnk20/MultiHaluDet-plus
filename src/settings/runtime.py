@@ -36,7 +36,7 @@ class _PipelineHighlighter(RegexHighlighter):
         r"(?i)(?P<error>\b(?:error|failed|failure|exception|traceback)\b)",
         r"(?i)(?P<warning>\b(?:warning|warn)\b)",
         r"(?i)(?P<success>\b(?:success|completed|saved|done)\b)",
-        r"(?i)(?P<stage>\bstage\s+\d+|---[^-\n]+---)",
+        r"(?i)(?P<stage>\bstage\s+\d+|---[^\n]+---)",
         r"(?i)(?P<metric>\b(?:auc|f1|accuracy|seed|dataset|model):)",
         r"(?P<number>(?<![\w.])[-+]?\d+(?:,\d{3})*(?:\.\d+)?%?(?![\w.]))",
     ]

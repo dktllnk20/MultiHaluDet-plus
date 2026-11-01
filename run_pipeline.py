@@ -267,7 +267,7 @@ def stage_1_extract_v2(args, config, samples=None):
 
 
 def _v2_context(args, config):
-    """Rows and the outer split shared by the probe stage and the training stage."""
+    """Rows and the outer split shared by Stage 1 probes and Stage 2 training."""
     try:
         d = load_v2(_feat_dir2(args))
     except FileNotFoundError:
@@ -278,8 +278,8 @@ def _v2_context(args, config):
     return d, keep, y, groups, tr, te
 
 
-def stage_2_probe(args, config):
-    print(f"\n--- V2 linear probes (seed {config.seed}) ---")
+def stage_1_probe(args, config):
+    print(f"\n--- Stage 1 (v2): linear probes (seed {config.seed}) ---")
     path = _probe_path(args, config)
     if os.path.exists(path) and not _opt(args, "redo_probe", False):
         print(f"{path} exists; reusing the cached probes")
@@ -380,8 +380,8 @@ def _train_fold(fold, tr_idx, val_idx, X_seq, X_glob, y, X_seq_test, X_glob_test
             best_auc)
 
 
-def stage_2_3_train_oof(args, config):
-    print("\n--- Detector training and out-of-fold feature generation ---")
+def stage_2_train_oof(args, config):
+    print("\n--- Stage 2: Detector training and out-of-fold feature generation ---")
     print(f"seed={config.seed} mixup={config.use_mixup} cutmix={config.use_cutmix} "
           f"layer_delta={config.use_layer_delta} layer_scale={config.scale_layer_weights} "
           f"rank_weight={config.rank_loss_weight} answer_ll={config.use_answer_ll} "
@@ -455,8 +455,8 @@ def stage_2_3_train_oof(args, config):
     print("Training and OOF generation completed.")
 
 
-def stage_4_ensemble(args, config):
-    print(f"\n--- Ensemble evaluation (stack mode: {args.stack_mode}) ---")
+def stage_3_ensemble(args, config):
+    print(f"\n--- Stage 3: Ensemble evaluation (stack mode: {args.stack_mode}) ---")
     key = _key(args)
     try:
         y_train = np.load(f'results/oof/y_train_{key}.npy')
@@ -512,6 +512,8 @@ def stage_4_ensemble(args, config):
 
 def run_model(args):
     args.v2 = args.v2 or args.feat == "v2"
+    if args.stack_mode is None:
+        args.stack_mode = "logit" if args.v2 else "vector"
 
     config = get_config()
     config.seed = args.seed
@@ -535,15 +537,11 @@ def run_model(args):
             _save_extract_state(state_path, _extract_signature(args, config, samples))
             print(f"[resume] Stage 1 completion saved: {state_path.relative_to(ROOT_DIR)}")
         if args.v2:
-            stage_2_probe(args, config)
+            stage_1_probe(args, config)
     if args.stage in ("train_oof", "all"):
-        stage_2_3_train_oof(args, config)
+        stage_2_train_oof(args, config)
     if args.stage in ("ensemble", "all"):
-        stage_4_ensemble(args, config)
-    if args.stage == "probe":
-        if not args.v2:
-            raise SystemExit("The probe stage requires --feat v2 or --v2.")
-        stage_2_probe(args, config)
+        stage_3_ensemble(args, config)
 
 
 def main(argv=None):
@@ -594,9 +592,9 @@ def main(argv=None):
                         help="Feature version, accepted as an alias for --v2 by RQ workflows.")
     parser.add_argument("--models", nargs="+", choices=PIPELINE_MODELS, default=["mistral-7b"],
                         help="One or both supported models (default: mistral-7b).")
-    parser.add_argument("--dataset", choices=["halueval", "triviaqa"], default="halueval",
-                        help="Dataset to process (default: halueval).")
-    parser.add_argument("--stage", choices=["extract", "probe", "train_oof", "ensemble", "all"], default="all",
+    parser.add_argument("--dataset", nargs="+", choices=["halueval", "triviaqa"], default=["halueval"],
+                        help="Dataset(s) to process (default: halueval).")
+    parser.add_argument("--stage", choices=["extract", "train_oof", "ensemble", "all"], default="all",
                         help="extract includes v2 probes; all runs every stage (default: all).")
     parser.add_argument("--limit", type=int, help="Process at most this many dataset records (positive integer).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
@@ -606,7 +604,8 @@ def main(argv=None):
     parser.add_argument("--glob_use", default="base,ll,yn")
     parser.add_argument("--quant", choices=["4bit", "8bit", "fp16"], default="4bit")
     parser.add_argument("--extract_batch_size", type=int, default=4)
-    parser.add_argument("--stack_mode", choices=["vector", "logit"], default="vector")
+    parser.add_argument("--stack_mode", choices=["vector", "logit"], default=None,
+                        help="Stacking input (default: vector for base, logit for v2).")
     parser.add_argument("--stacker", choices=["full", "lite"], default="full")
     parser.add_argument("--redo_probe", action="store_true")
     parser.add_argument("--pair_center", action="store_true")
@@ -620,20 +619,23 @@ def main(argv=None):
         parser.error("--limit must be a positive integer.")
 
     os.chdir(ROOT_DIR)
+    datasets = args.dataset
     for model in args.models:
         args.model = model
         model_family = "mistral" if model.startswith("mistral") else "llama"
         variant = "v2" if args.v2 else "base"
-        log_path = ROOT_DIR / "logs" / model_family / (
-            f"{args.dataset}_{variant}_{args.stage}_s{args.seed}.log"
-        )
-        with capture_run_log(log_path):
-            print(f"Model: {model}")
-            print(f"Dataset: {args.dataset} | features: {variant}")
-            limit_text = args.limit if args.limit is not None else "all"
-            print(f"Stage: {args.stage} | seed: {args.seed} | limit: {limit_text}")
-            run_model(args)
-        print(f"Log saved to {log_path.relative_to(ROOT_DIR)}")
+        for dataset in datasets:
+            args.dataset = dataset
+            log_path = ROOT_DIR / "logs" / model_family / (
+                f"{dataset}_{variant}_{args.stage}_s{args.seed}.log"
+            )
+            with capture_run_log(log_path):
+                print(f"Model: {model}")
+                print(f"Dataset: {dataset} | features: {variant}")
+                limit_text = args.limit if args.limit is not None else "all"
+                print(f"Stage: {args.stage} | seed: {args.seed} | limit: {limit_text}")
+                run_model(args)
+        args.dataset = datasets
 
 
 if __name__ == "__main__":
