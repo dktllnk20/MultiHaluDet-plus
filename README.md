@@ -27,7 +27,16 @@ White-box hallucination detection for LLMs from their internal states, evaluated
 | Extra metric | - | **pair accuracy** (wrong answer scored above the correct one) |
 | Optional | - | `--pair_center` (subtract per-question mean) |
 
-## Setup
+### Results summary
+
+| Dataset          | Model      | Base AUROC | V2 AUROC  | Δ AUROC   |
+| ---------------- | ---------- | ---------- | --------- | --------- |
+|  HaluEval | Mistral-7B | 0.9849     | **0.9931** | +0.0082 |
+|  HaluEval | Llama-2-7B | 0.9846     | **0.9917** | +0.0071 |
+|  TriviaQA | Mistral-7B | 0.6452     | **0.8226** | +0.1774 |
+|  TriviaQA | Llama-2-7B | 0.5931     | **0.7650** | +0.1719 |
+
+## Installation
 
 ```bash
 git clone https://github.com/dktllnk20/MultiHaluDet-plus.git && cd MultiHaluDet-plus
@@ -54,7 +63,7 @@ Data notes:
 
 Hardware: All experiments were conducted on a system equipped with an **AMD Ryzen 7 7435HS CPU** and an **NVIDIA GeForce RTX 4050 GPU** with 6 GB of VRAM.
 
-## Run
+## Usage
 
 ### Pipeline
 ```bash
@@ -78,48 +87,25 @@ python run_pipeline.py --rq 2
 - mistral-7b
 - llama2-7b
 
-## Results summary
 
-| Dataset          | Model      | Base AUROC | V2 AUROC  | Δ AUROC   |
-| ---------------- | ---------- | ---------- | --------- | --------- |
-|  HaluEval | Mistral-7B | 0.9849     | **0.9931** | +0.0082 |
-|  HaluEval | Llama-2-7B | 0.9846     | **0.9917** | +0.0071 |
-|  TriviaQA | Mistral-7B | 0.6452     | **0.8226** | +0.1774 |
-|  TriviaQA | Llama-2-7B | 0.5931     | **0.7650** | +0.1719 |
-
-
-## Structure
+## Folder Structure
 
 ```
-.
-├──  data
-│   ├──  halueval.json
-│   └──  triviaqa.json
-├──  docs
-│   └──  paper.pdf
-├──  figures
-│   └──  pipeline-EN.png
-├──  LICENSE
-├── 󰂺 README.md
-├──  requirements.txt
-├──  run_pipeline.py
-└── 󰣞 src/
-    ├──  __init__.py
-    ├──  config.py
-    ├──  data/
-    ├──  ensemble/
-    ├──  models/
-    ├──  probe/
-    ├──  rq/
-    ├──  settings/
-    ├──  training/
-    └──  utils/
+src/
+├── data/
+├── ensemble/
+├── models/
+├── probe/
+├── rq/
+├── settings/
+├── training/
+└── utils/
 ```
 
-## contact
+## 🔗contact
 
 Have questions about this project, want to reproduce our experiments, or just want to know more? Feel free to reach out! We'd be happy to hear from you.
 
-- **Email:** dktlln.k20@gmail.com
+- ✉️**Email:** dktlln.k20@gmail.com
 
 Whether it's a question, feedback, or a collaboration idea, don't hesitate to drop us an email. We're always happy to connect!
