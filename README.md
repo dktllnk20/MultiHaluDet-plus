@@ -123,7 +123,7 @@ Run the complete pipeline:
 python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42
 
 # v2
-python run_pipeline.py --v2 --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42
+python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42 --v2
 
 ```
 
