@@ -20,7 +20,7 @@ The original dataset is based on TriviaQA:
 
 Please make sure to acknowledge the original TriviaQA dataset when using this data.
 
-## Get in Touch
+## Contact
 
 If you'd like to access the dataset, have questions about its construction, or are interested in collaborating, feel free to reach out!
 
