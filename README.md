@@ -157,7 +157,7 @@ python run_pipeline.py --rq 2
 ## Folder Structure
 
 ```text
-src.
+src/
 ├── config.py
 ├── data/
 │   ├── feature_extractor.py
