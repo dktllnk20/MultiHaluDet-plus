@@ -8,12 +8,12 @@ White-box hallucination detection for large language models (LLMs) using interna
 
 The pipeline has three stages: `extract`, `train_oof`, and `ensemble`.
 
-### 1. Extract (`--stage extract`)
+### 1. Extract 
 
 A frozen LLM (4-bit NF4 quantization by default) reads each question–answer pair. Two feature configurations are available:
 
-- **Base** (default): 12 statistics from each of 32 sampled hidden-state layers, plus 30 global features derived from the output logits.
-- **v2** (`--v2`): the same scalar statistics, plus the full hidden-state vectors in two views (`last`, `amean`), a verification prompt (*"Is the proposed answer correct? Answer (Yes or No):"*), and answer-token likelihood / PMI features. Global features increase to 46 (30 base + 13 answer likelihood / PMI + 3 Yes/No log-probability).
+- **Base**: 12 statistics from each of 32 sampled hidden-state layers, plus 30 global features derived from the output logits.
+- **v2**: the same scalar statistics, plus the full hidden-state vectors in two views (`last`, `amean`), a verification prompt (*"Is the proposed answer correct? Answer (Yes or No):"*), and answer-token likelihood / PMI features. Global features increase to 46 (30 base + 13 answer likelihood / PMI + 3 Yes/No log-probability).
 
 With `--v2`, this stage also fits the **layer probes**. For each (view, layer) pair, an out-of-fold linear probe is trained:
 
@@ -21,7 +21,7 @@ With `--v2`, this stage also fits the **layer probes**. For each (view, layer) p
 
 Folds are grouped by question. The probe logits are appended to the detector input.
 
-### 2. Train OOF (`--stage train_oof`)
+### 2. Train OOF 
 
 **MultiHaluDet** is trained independently in each of the 5 inner folds. It consists of:
 
@@ -33,12 +33,12 @@ The objective combines BCE, Focal, Asymmetric, and Contrastive losses. Optimizat
 
 Each fold produces out-of-fold features and logits for the training split, and test outputs for the held-out split.
 
-### 3. Ensemble (`--stage ensemble`)
+### 3. Ensemble 
 
 The out-of-fold outputs are stacked. Base classifiers (RF, HistGB, LR, SVM, XGB, LGBM) are fitted with 5-fold cross-validation, and a logistic-regression meta-learner combines their log-odds.
 
-- **Base** (`--stack_mode vector`, default): the input is the 576-d feature vector from each fold network. Test features are averaged over the 5 networks before stacking.
-- **v2** (`--stack_mode logit`, default): the input is each network's out-of-fold logit plus the global features. The stacker is applied to the test logits of each network, and the 5 outputs are averaged.
+- **Base**: the input is the 576-d feature vector from each fold network. Test features are averaged over the 5 networks before stacking.
+- **v2**: the input is each network's out-of-fold logit plus the global features. The stacker is applied to the test logits of each network, and the 5 outputs are averaged.
 
 `--stacker lite` uses only LR and LightGBM.
 
