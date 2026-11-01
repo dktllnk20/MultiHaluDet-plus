@@ -42,6 +42,7 @@ RESULTS = ROOT / "results" / "rq2"
 BASE_RESULTS = RESULTS
 MODELS = ["mistral-7b", "llama2-7b"]
 DATASETS = ["halueval", "triviaqa"]
+LANGUAGE = "en"
 DEFAULT_SEEDS = [1, 11, 29, 37, 43]
 PERTURBATIONS = ["lowercase", "no_punct", "shuffle_words", "cut_first3", "keep_first3"]
 SKIPPABLE = ["b2", "b3", "hs", "resid", "complement", "perturb", "importance"]
@@ -55,10 +56,6 @@ HEDGES = {
     "en": ["maybe", "perhaps", "possibly", "probably", "might", "may", "could", "likely", "seems",
            "unclear", "not sure", "i think", "however", "although", "approximately", "about",
            "around", "sorry", "as an ai", "cannot", "not provided", "no information", "there is no"],
-    "fr": ["peut-être", "probablement", "possiblement", "environ", "sans doute", "cependant",
-           "il semble", "pourrait", "désolé", "en tant qu'ia"],
-    "vi": ["có thể", "có lẽ", "có vẻ", "khoảng", "dường như", "tuy nhiên", "không chắc",
-           "hình như", "xin lỗi"],
 }
 _HEDGE_RE = {k: re.compile(r"\b(?:" + "|".join(re.escape(w) for w in v) + r")\b", re.IGNORECASE)
              for k, v in HEDGES.items()}
@@ -493,22 +490,22 @@ def run_hs(ns, cfg, spec, args, y_exp, g_exp):
         print(f"  [hs] Loading cache {cache.name}", flush=True)
     else:
         if spec["probe"] != "none":
-            rp.stage_2_probe(ns, cfg)           # Reuse the cached probe created by RQ1 when available.
+            rp.stage_1_probe(ns, cfg)           # Reuse the cached probe created by RQ1 when available.
         needed = ["oof_logits", "test_logits", "X_glob_train", "X_glob_test", "y_train", "y_test", "g_train", "g_test"]
         if ns.stack_mode == "vector":
             needed += ["X_train_deep", "X_test_deep"]
         if not all(Path(f"results/oof/{n}_{key}.npy").exists() for n in needed):
-            rp.stage_2_3_train_oof(ns, cfg)
+            rp.stage_2_train_oof(ns, cfg)
         cap, orig = {}, rp.plot_publication_results
-        # Capture scores from the plot callback because stage_4_ensemble returns no probabilities.
+        # Capture scores from the plot callback because stage_3_ensemble returns no probabilities.
         rp.plot_publication_results = lambda probs, labels, *a, **k: cap.update(
             probs=np.asarray(probs), y=np.asarray(labels))
         try:
-            rp.stage_4_ensemble(ns, cfg)
+            rp.stage_3_ensemble(ns, cfg)
         finally:
             rp.plot_publication_results = orig
         if "probs" not in cap:
-            raise RuntimeError(f"Stage 4 produced no probabilities for {key}; features, probes, or OOF data may be missing.")
+            raise RuntimeError(f"Stage 3 produced no probabilities for {key}; features, probes, or OOF data may be missing.")
         out = dict(final=cap["probs"],
                    deep=np.load(f"results/oof/test_logits_{key}.npy").mean(0),
                    oof=np.load(f"results/oof/oof_logits_{key}.npy"),
@@ -663,7 +660,7 @@ def write_pair_length_stats(out: Path, y, groups, tok, words):
 # ----------------------------------------------------------------------------------------------
 # One model/dataset combination
 # ----------------------------------------------------------------------------------------------
-def run_combo(args, model, lang, ds="halueval"):
+def run_combo(args, model, ds="halueval"):
     from src.data.loader import load_halueval, load_triviaqa
     from src.data.splits import make_groups, pair_accuracy
 
@@ -672,7 +669,8 @@ def run_combo(args, model, lang, ds="halueval"):
     out.mkdir(parents=True, exist_ok=True)
     t_combo = time.perf_counter()
     # TriviaQA has two rows per question; its loader samples only above max_samples.
-    samples = load_halueval(lang=lang) if ds == "halueval" else load_triviaqa(lang=lang, seed=42)
+    samples = (load_halueval(lang=LANGUAGE) if ds == "halueval"
+               else load_triviaqa(lang=LANGUAGE, seed=42))
     if args.limit is not None:
         samples = samples[:args.limit]
     Q = [s["question"] for s in samples]
@@ -687,7 +685,7 @@ def run_combo(args, model, lang, ds="halueval"):
         spec, comps = hs_spec(args)
         print(f"[hs] cond={args.hs_cond} prompt={spec['pm']} glob={'+'.join(spec['glob'])} probe={spec['probe']} "
               f"stack={args.stack_mode or spec['stack']} sig={spec['sig']}", flush=True)
-        ns0 = hs_ns(ds, lang, model, args.seeds[0], spec, args)
+        ns0 = hs_ns(ds, LANGUAGE, model, args.seeds[0], spec, args)
         ensure_features_v2(ns0, args, hs_config(args.seeds[0], comps))
         y_feat = np.load(feat_dir(ns0) / "y.npy")
         if len(y_feat) != len(y) or not np.array_equal(y_feat, y):
@@ -696,12 +694,12 @@ def run_combo(args, model, lang, ds="halueval"):
             return False
 
     count_tokens = make_token_counter(model)
-    Z = surface_features(Q, A, lang, count_tokens)
+    Z = surface_features(Q, A, LANGUAGE, count_tokens)
     perts = [] if "perturb" in args.skip else args.perturb
     Zp, Ap = {}, {}
     for p in perts:
         Ap[p] = apply_perturbation(p, A)
-        Zp[p] = surface_features(Q, Ap[p], lang, count_tokens)
+        Zp[p] = surface_features(Q, Ap[p], LANGUAGE, count_tokens)
     Qa, Aa = np.asarray(Q, dtype=object), np.asarray(A, dtype=object)
     write_pair_length_stats(out, y, make_groups(samples), Z[:, I_TOK], Z[:, ALL_COLS.index("ans_words")])
 
@@ -712,7 +710,7 @@ def run_combo(args, model, lang, ds="halueval"):
         print(f"\n--- seed {seed} ---", flush=True)
         seed_all(seed)
         cfg = hs_config(seed, comps) if use_hs else base_cfg(seed)
-        ns = hs_ns(ds, lang, model, seed, spec, args) if use_hs else None
+        ns = hs_ns(ds, LANGUAGE, model, seed, spec, args) if use_hs else None
         sp = get_split(ns, cfg, samples, use_hs)
         keep, tr, te, yk, gk = sp["keep"], sp["tr"], sp["te"], sp["y"], sp["groups"]
         Zk, Qk, Ak = Z[keep], Qa[keep], Aa[keep]
@@ -754,7 +752,7 @@ def run_combo(args, model, lang, ds="halueval"):
                 comp_rows.append(cdf)
                 preds.update(cscores)
             if "resid" not in args.skip:
-                ns_r = hs_ns(f"{ds}-resid{seed}", lang, model, seed, spec, args)
+                ns_r = hs_ns(f"{ds}-resid{seed}", LANGUAGE, model, seed, spec, args)
                 if not hs_is_cached(ns_r, args):
                     info = write_resid_v2(Z, keep[tr], keep[te], ns, ns_r)
                     r2_rows.append(dict(seed=seed, **info))
@@ -777,7 +775,7 @@ def run_combo(args, model, lang, ds="halueval"):
                 for name, s in pp.items():
                     pert_rows.append(dict(seed=seed, perturbation=p, name=name, auc=fast_auc(yte, s)))
             for p in (args.hs_perturb if use_hs else []):
-                ns_p = hs_ns(f"{ds}-p-{p}", lang, model, seed, spec, args)
+                ns_p = hs_ns(f"{ds}-p-{p}", LANGUAGE, model, seed, spec, args)
                 if not hs_is_cached(ns_p, args):
                     ensure_features_v2(ns_p, args, cfg, samples=[
                         {**s_, "answer": a_} for s_, a_ in zip(samples, apply_perturbation(p, A))])
@@ -931,7 +929,7 @@ def main(argv=None):
     for ds in args.datasets:
         for model in args.models:
             try:
-                if not run_combo(args, model, "en", ds):
+                if not run_combo(args, model, ds):
                     failed.append((ds, model))
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
