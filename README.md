@@ -6,55 +6,62 @@ White-box hallucination detection for large language models (LLMs) using interna
 
 ## Overview
 
-The project consists of four main stages:
+The pipeline has three stages: `extract`, `train_oof`, and `ensemble`.
 
-1. **Feature Extraction** (frozen LLM, 4-bit NF4 quantization by default).
+### 1. Extract (`--stage extract`)
 
-   Two feature configurations are available:
+A frozen LLM (4-bit NF4 quantization by default) reads each question–answer pair. Two feature configurations are available:
 
-   - **Base** (default): Extracts 12 statistical features from each of 32 sampled hidden-state layers, along with 30 global features derived from the output logits.
-   - **v2** (`--v2`): Retains the full hidden-state vectors using two views (`last`, `amean`) and introduces a verification prompt: *"Is the proposed answer correct? Answer (Yes or No):"*. Global features increase to 46 (30 base features + 13 answer log-likelihood / PMI features + 3 Yes/No log-probability features).
+- **Base** (default): 12 statistics from each of 32 sampled hidden-state layers, plus 30 global features derived from the output logits.
+- **v2** (`--v2`): the same scalar statistics, plus the full hidden-state vectors in two views (`last`, `amean`), a verification prompt (*"Is the proposed answer correct? Answer (Yes or No):"*), and answer-token likelihood / PMI features. Global features increase to 46 (30 base + 13 answer likelihood / PMI + 3 Yes/No log-probability).
 
-2. **Layer Probes** (v2 only).
+With `--v2`, this stage also fits the **layer probes**. For each (view, layer) pair, an out-of-fold linear probe is trained:
 
-   For each (view, layer) pair, an out-of-fold linear probe is trained using the following pipeline:
+`StandardScaler -> PCA(256) -> LogisticRegression(C=0.02)`
 
-   `StandardScaler -> PCA(256) -> LogisticRegression(C=0.02)`
+Folds are grouped by question. The probe logits are appended to the detector input.
 
-   Folds are grouped by question. Probe logits are automatically appended to the network input after feature extraction when `--v2` is enabled.
+### 2. Train OOF (`--stage train_oof`)
 
-3. **MultiHaluDet** (trained independently within each inner fold).
+**MultiHaluDet** is trained independently in each of the 5 inner folds. It consists of:
 
-   The architecture consists of:
-   - A sequential branch with multi-scale attention, a Transformer, and attention pooling.
-   - A global branch implemented as an MLP.
-   - A gated fusion mechanism that combines both branches.
+- A sequential branch (multi-scale attention, Transformer encoder, attention pooling) over the layer axis.
+- A global branch (MLP).
+- A gated fusion of both branches, followed by a classifier head.
 
-   The training objective combines BCE, Focal, Asymmetric, and Contrastive losses. Optimization uses AdamW with Exponential Moving Average (EMA), Mixup, and CutMix.
+The objective combines BCE, Focal, Asymmetric, and Contrastive losses. Optimization uses AdamW with EMA, Mixup, and CutMix. Three optional components are disabled by default: delta channels (`--layer_delta`), layer-weight scaling (`--layer_scale`), and a pairwise AUC ranking loss (`--rank_weight`).
 
-   In v2, delta channels, layer-weight scaling, and pairwise AUC ranking loss are also available as optional components. All three are disabled by default.
+Each fold produces out-of-fold features and logits for the training split, and test outputs for the held-out split.
 
-4. **Stacking**.
+### 3. Ensemble (`--stage ensemble`)
 
-   Out-of-fold predictions from the five fold-specific networks are passed to the base classifiers (RF, HistGB, LR, SVM, XGB, and LGBM). A logistic regression meta-learner then combines their log-odds. Final predictions are obtained by averaging across the five test sets.
+The out-of-fold outputs are stacked. Base classifiers (RF, HistGB, LR, SVM, XGB, LGBM) are fitted with 5-fold cross-validation, and a logistic-regression meta-learner combines their log-odds.
+
+- **Base** (`--stack_mode vector`, default): the input is the 576-d feature vector from each fold network. Test features are averaged over the 5 networks before stacking.
+- **v2** (`--stack_mode logit`, default): the input is each network's out-of-fold logit plus the global features. The stacker is applied to the test logits of each network, and the 5 outputs are averaged.
+
+`--stacker lite` uses only LR and LightGBM.
 
 ### What v2 Adds Over Base
 
 | Component | Base | v2 |
 |---|---|---|
-| LLM features | 12 scalar statistics per sampled layer | Same scalar statistics, with additional hidden-state vectors used to train layer probes. Their per-layer logits are fed into the detector. |
-| Prompt | `Question: ... Answer: ...` | Verification prompt by default, with answer-token likelihood/PMI features and verification-only Yes/No log-probabilities. Plain prompting is also supported. |
-| Global features | 30 | 43 with the plain prompt or 46 with the verification prompt, plus 2 values per probe view when global probes are enabled (50 by default with verification prompting and two views). |
-| Pipeline stages | `extract`, `train_oof`, `ensemble` | `extract` (including probe training), `train_oof`, `ensemble` |
-| Network | 12 sequential channels per layer | Probe-logit channels enabled by default. Delta channels and layer-weight scaling are optional. Pairwise AUC ranking loss is also optional. |
-| Train/test split | By row | **By question** (both answers belonging to the same question remain in the same split). |
-| Stacker | 5-fold splitting by row; 576-dimensional vector features and 6 classifiers by default | 5-fold splitting by question; 576-dimensional vector features and 6 classifiers by default. Supports optional OOF-logit input (`--stack_mode logit`) and a lightweight 2-classifier stacker (`lite`). |
-| Additional metric | - | **Pair accuracy** (whether the incorrect answer receives a higher score than the correct answer). |
+| LLM features | 12 scalar statistics per sampled layer | Same 12 statistics, plus full hidden-state vectors (views `last`, `amean`) used to train layer probes. |
+| Prompt | `Question: ... Answer: ...` | Verification prompt by default (`--prompt_mode verify`); plain prompt supported (`--prompt_mode plain`). |
+| Answer likelihood | - | Answer-token log-likelihood, entropy, rank, and PMI against the question-free prompt (13 features); Yes/No log-probabilities with the verification prompt (3 features). |
+| Probes | - | 32 layers × 2 views out-of-fold linear probes, fitted inside `extract`. |
+| Global features | 30 | 43 (plain) or 46 (verify), plus 4 probe-derived values (2 per view) by default: 47 / 50. |
+| Sequential channels | 12 per layer | 14 per layer by default (12 + 2 probe logits). |
+| Optional components | `--layer_delta`, `--layer_scale`, `--rank_weight` (off by default) | Same flags, off by default. |
+| Train/test split | By row | **By question** (both answers of a question stay in the same split). |
+| Stacker | 5-fold by row; 576-d vector input (`--stack_mode vector`) | 5-fold by question; OOF-logit input (`--stack_mode logit`); vector input still available. |
+| Stacker test prediction | Features averaged over the 5 networks, then stacked | Stacker applied to each network's logits, outputs averaged. |
+| Additional metric | - | **Pair accuracy** (the incorrect answer scores higher than the correct one). |
 | Optional configuration | - | `--pair_center` (subtracts the per-question mean). |
 
 ### Results Summary
 
-The following table reports the AUROC achieved by Base and v2 across the two evaluation datasets.
+The following table reports **the mean AUROC over 5 seeds (1,11,29,37,43)** achieved by Base and v2 across the two evaluation datasets.
 
 | Dataset | Model | Base AUROC | v2 AUROC | Δ AUROC |
 |---|---|---:|---:|---:|
@@ -112,7 +119,12 @@ All experiments were conducted on a system equipped with:
 Run the complete pipeline:
 
 ```bash
+# baseline
 python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42
+
+# v2
+python run_pipeline.py --v2 --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42
+
 ```
 
 Alternatively, execute each stage independently:
