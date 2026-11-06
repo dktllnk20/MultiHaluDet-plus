@@ -510,7 +510,8 @@ def stage_3_ensemble(args, config):
     print(f"Saved results to {plot_path}")
 
 
-def run_model(args):
+def run_model(args, stage=None):
+    stage = stage or args.stage
     args.v2 = args.v2 or args.feat == "v2"
     if args.stack_mode is None:
         args.stack_mode = "logit" if args.v2 else "vector"
@@ -524,7 +525,7 @@ def run_model(args):
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
 
-    if args.stage in ("extract", "all"):
+    if stage in ("extract", "all"):
         samples = _load_samples(args, config)
         if _extraction_is_resumable(args, config, samples):
             print("[resume] Stage 1 extraction already completed for matching inputs; skipping feature extraction.")
@@ -538,9 +539,9 @@ def run_model(args):
             print(f"[resume] Stage 1 completion saved: {state_path.relative_to(ROOT_DIR)}")
         if args.v2:
             stage_1_probe(args, config)
-    if args.stage in ("train_oof", "all"):
+    if stage in ("train_oof", "all"):
         stage_2_train_oof(args, config)
-    if args.stage in ("ensemble", "all"):
+    if stage in ("ensemble", "all"):
         stage_3_ensemble(args, config)
 
 
@@ -597,7 +598,8 @@ def main(argv=None):
     parser.add_argument("--stage", choices=["extract", "train_oof", "ensemble", "all"], default="all",
                         help="extract includes v2 probes; all runs every stage (default: all).")
     parser.add_argument("--limit", type=int, help="Process at most this many dataset records (positive integer).")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
+    parser.add_argument("--seed", type=int, nargs="+", default=[42],
+                        help="One or more random seeds (default: 42).")
     parser.add_argument("--views", default="last,amean")
     parser.add_argument("--prompt_mode", choices=["verify", "plain"], default="verify")
     parser.add_argument("--probe_use", choices=["both", "seq", "glob", "none"], default="both")
@@ -620,21 +622,26 @@ def main(argv=None):
 
     os.chdir(ROOT_DIR)
     datasets = args.dataset
+    seeds = args.seed
     for model in args.models:
         args.model = model
         model_family = "mistral" if model.startswith("mistral") else "llama"
         variant = "v2" if args.v2 else "base"
         for dataset in datasets:
             args.dataset = dataset
-            log_path = ROOT_DIR / "logs" / model_family / (
-                f"{dataset}_{variant}_{args.stage}_s{args.seed}.log"
-            )
-            with capture_run_log(log_path):
-                print(f"Model: {model}")
-                print(f"Dataset: {dataset} | features: {variant}")
-                limit_text = args.limit if args.limit is not None else "all"
-                print(f"Stage: {args.stage} | seed: {args.seed} | limit: {limit_text}")
-                run_model(args)
+            for seed in seeds:
+                args.seed = seed
+                stages = ("extract", "train_oof", "ensemble") if args.stage == "all" else (args.stage,)
+                for stage in stages:
+                    log_path = ROOT_DIR / "logs" / model_family / (
+                        f"{dataset}_{variant}_{stage}_s{args.seed}.log"
+                    )
+                    with capture_run_log(log_path):
+                        print(f"Model: {model}")
+                        print(f"Dataset: {dataset} | features: {variant}")
+                        limit_text = args.limit if args.limit is not None else "all"
+                        print(f"Stage: {stage} | seed: {args.seed} | limit: {limit_text}")
+                        run_model(args, stage=stage)
         args.dataset = datasets
 
 
