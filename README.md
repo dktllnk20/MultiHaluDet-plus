@@ -120,10 +120,10 @@ Run the complete pipeline:
 
 ```bash
 # baseline
-python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42
+python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 1 11 29 37 43
 
 # v2
-python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 42 --v2
+python run_pipeline.py --models mistral-7b llama2-7b --dataset triviaqa halueval --stage all --seed 1 11 29 37 43 --v2
 
 ```
 
